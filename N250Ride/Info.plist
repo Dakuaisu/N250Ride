@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>N250 Ride</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.n250ride.open</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>n250ride</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>N250GoogleAPIKey</key>
+	<string>$(N250_GOOGLE_API_KEY)</string>
+	<key>N250LiveNavigationAuthorized</key>
+	<string>$(N250_LIVE_NAVIGATION_AUTHORIZED)</string>
+	<key>N250NavigationProvider</key>
+	<string>$(N250_NAV_PROVIDER)</string>
+	<key>N250StatusProfile</key>
+	<string>$(N250_STATUS_PROFILE)</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>N250 Ride connects to your motorcycle's instrument cluster to show turn arrows, distance and arrival time.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>N250 Ride keeps guiding and updating your bike's dashboard while the phone is locked during navigation.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>N250 Ride uses your location to calculate the route and give turn-by-turn guidance.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>location</string>
+		<string>audio</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>

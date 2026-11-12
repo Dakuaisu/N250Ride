@@ -1,0 +1,11 @@
+// Copy to Config/Local.xcconfig (ignored). Never commit real values.
+// N250_DEVELOPMENT_TEAM = ABCDE12345
+// N250_BUNDLE_ID = com.yourname.n250ride
+
+// Only after GATE-1/GATE-2 pass and the owner authorises activation (task 10).
+// The key must be restricted to this bundle ID and the Navigation SDK.
+// N250_GOOGLE_API_KEY = your-restricted-key
+// N250_LIVE_NAVIGATION_AUTHORIZED = YES
+
+// Only after the N250 bench test proves a profile (task 9): legacy55 or v2_89.
+// N250_STATUS_PROFILE = v2_89

@@ -1,0 +1,11 @@
+// Tracked defaults: no-key simulation, no proven status profile.
+N250_BUNDLE_ID = com.n250ride.app
+// apple (MapKit car routing) or google (needs the SDK packages re-enabled in project.yml)
+N250_NAV_PROVIDER = apple
+N250_DEVELOPMENT_TEAM =
+N250_GOOGLE_API_KEY =
+N250_LIVE_NAVIGATION_AUTHORIZED = NO
+N250_STATUS_PROFILE =
+
+// Machine-local overrides (ignored by version control). Copy Local.example.xcconfig.
+#include? "Local.xcconfig"

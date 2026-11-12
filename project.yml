@@ -1,0 +1,123 @@
+name: N250Ride
+options:
+  bundleIdPrefix: com.n250ride
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    TARGETED_DEVICE_FAMILY: "1"
+packages:
+  RideCore:
+    path: Packages/RideCore
+# Google Navigation SDK (excluded while Apple MapKit is the provider). To re-enable:
+# add these packages and the two app dependencies below, set N250_NAV_PROVIDER = google.
+#  GoogleNavigation:
+#    url: https://github.com/googlemaps/ios-navigation-sdk
+#    exactVersion: 11.3.0
+#  GoogleMaps:
+#    url: https://github.com/googlemaps/ios-maps-sdk
+#    exactVersion: 11.3.0
+targets:
+  N250Ride:
+    type: application
+    platform: iOS
+    sources: [N250Ride, Shared]
+    dependencies:
+      - package: RideCore
+      - target: N250RideWidgets
+      - target: N250RideShare
+#      - package: GoogleNavigation
+#        product: GoogleNavigation
+#      - package: GoogleMaps
+#        product: GoogleMaps
+    info:
+      path: N250Ride/Info.plist
+      properties:
+        CFBundleDisplayName: N250 Ride
+        UILaunchScreen: {}
+        NSSupportsLiveActivities: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.n250ride.open
+            CFBundleURLSchemes: [n250ride]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSBluetoothAlwaysUsageDescription: N250 Ride connects to your motorcycle's instrument cluster to show turn arrows, distance and arrival time.
+        NSLocationWhenInUseUsageDescription: N250 Ride uses your location to calculate the route and give turn-by-turn guidance.
+        NSLocationAlwaysAndWhenInUseUsageDescription: N250 Ride keeps guiding and updating your bike's dashboard while the phone is locked during navigation.
+        UIBackgroundModes: [bluetooth-central, location, audio]
+        N250NavigationProvider: $(N250_NAV_PROVIDER)
+        N250GoogleAPIKey: $(N250_GOOGLE_API_KEY)
+        N250LiveNavigationAuthorized: $(N250_LIVE_NAVIGATION_AUTHORIZED)
+        N250StatusProfile: $(N250_STATUS_PROFILE)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(N250_BUNDLE_ID)
+        DEVELOPMENT_TEAM: $(N250_DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+  N250RideWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [N250RideWidgets, Shared/RideActivityAttributes.swift]
+    info:
+      path: N250RideWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: N250 Ride
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(N250_BUNDLE_ID).widgets
+        DEVELOPMENT_TEAM: $(N250_DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+  N250RideShare:
+    type: app-extension
+    platform: iOS
+    sources: [N250RideShare, Shared/ShareInbox.swift]
+    dependencies:
+      - package: RideCore
+    info:
+      path: N250RideShare/Info.plist
+      properties:
+        CFBundleDisplayName: N250 Ride
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(N250_BUNDLE_ID).share
+        DEVELOPMENT_TEAM: $(N250_DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+  N250RideTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [N250RideTests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: N250Ride
+  N250RideUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [N250RideUITests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: N250Ride
+schemes:
+  N250Ride:
+    build:
+      targets:
+        N250Ride: all
+    test:
+      targets: [N250RideTests, N250RideUITests]
