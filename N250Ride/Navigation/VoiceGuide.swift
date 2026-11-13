@@ -142,6 +142,12 @@ final class VoiceGuide {
         if let lastTestAt, now.duration(since: lastTestAt) < Self.testInterval { return }
         lastTestAt = now
         guard holds.subtracting([.speakerFallback]).isEmpty else { return }
+        // The sample replaces whatever is speaking, so no turn is left playing untracked behind it.
+        pending = nil
+        if current != nil {
+            current = nil
+            speech.stop()
+        }
         say(VoicePrompt(text: "This is N250 Ride. Directions will sound like this.", priority: .status,
                         session: SessionID(), generation: RouteGeneration(0)))
     }

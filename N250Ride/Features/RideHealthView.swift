@@ -175,6 +175,7 @@ struct RecoveryPrompt: View {
 /// Destinations shared or pasted while you were busy.
 struct WaitingDestinations: View {
     @Environment(AppModel.self) private var model
+    @State private var confirmingDiscard = false
 
     var body: some View {
         if !model.inbox.waiting.isEmpty || model.inbox.problem != nil {
@@ -184,6 +185,14 @@ struct WaitingDestinations: View {
                 }
                 if let problem = model.inbox.problem {
                     Text(problem).font(.footnote).foregroundStyle(.orange)
+                }
+                if model.inbox.isBlocked {
+                    Button("Discard saved destinations", role: .destructive) { confirmingDiscard = true }
+                        .accessibilityIdentifier("discardInboxButton")
+                        .confirmationDialog("Discard the saved destinations? They can't be read by this version.",
+                                            isPresented: $confirmingDiscard, titleVisibility: .visible) {
+                            Button("Discard", role: .destructive) { model.inbox.discardStored() }
+                        }
                 }
             } header: {
                 Text("Waiting destinations")

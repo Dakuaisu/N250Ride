@@ -201,13 +201,31 @@ final class BikeConnection: NSObject {
         let maximum = peripheral.maximumWriteValueLength(for: type)
         guard bytes.count <= maximum else { return "Too long: \(bytes.count) bytes, the bike accepts at most \(maximum)." }
         if withResponse {
-            guard case .success = router.beginRaw(characteristic.uuid.uuidString, pumpBusyOn: pump?.inFlightChannel) else {
+            guard case .success(let id) = router.beginRaw(characteristic.uuid.uuidString,
+                                                         pumpBusyOn: pump?.inFlightChannel) else {
                 return "The app's own write on this channel is still waiting for the bike. Try again in a moment."
+            }
+            watchRawWrite(id, on: peripheral.identifier)
+        } else {
+            guard peripheral.canSendWriteWithoutResponse else {
+                return "Bluetooth is busy sending. Try again in a moment."
             }
         }
         peripheral.writeValue(Data(bytes), for: characteristic, type: type)
         if !withResponse { onConsoleEvent?(.submitted(characteristic: uuid)) }
         return nil
+    }
+
+    /// A raw write the bike never answers leaves the link's answer order unknown and
+    /// holds its channel: after the same 3 s as the app's own writes, the link is retired.
+    private func watchRawWrite(_ id: Int, on target: UUID) {
+        let epoch = lifecycle.epoch
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, self.lifecycle.owns(target, epoch: epoch), self.router.isPending(id) else { return }
+            self.onConsoleEvent?(.wrote(characteristic: "-", error: "No answer from the bike in 3 s; reconnecting."))
+            self.dropLinkForReconnect()
+        }
     }
 
     func rawRead(_ uuid: String) -> String? {
@@ -317,6 +335,7 @@ final class BikeConnection: NSObject {
         attempt = 0
         let transport = CoreBluetoothClusterTransport(peripheral: peripheral, navigation: navigation, status: status)
         let pump = ClusterWritePump(transport: transport, clock: clock, link: info)
+        pump.isChannelHeld = { [weak self] channel in self?.router.holds(channel) ?? false }
         self.transport = transport
         self.pump = pump
         state = .ready(info)
@@ -478,6 +497,7 @@ extension BikeConnection: CBPeripheralDelegate {
             switch router.complete(uuid) {
             case .raw:
                 onConsoleEvent?(.wrote(characteristic: uuid, error: message))
+                pump?.channelReleased()
             case .pump(let channel):
                 pump?.didCompleteWrite(on: channel, success: message == nil)
             case .none:

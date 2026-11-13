@@ -145,6 +145,11 @@ final class RideHistoryStore {
         }
     }
 
+    /// Saves the current totals now (e.g. on reaching a stop), so a restart there loses nothing.
+    func checkpoint(now: Date) {
+        flushDraft(now: now)
+    }
+
     /// Leg change, reroute or pause: distance is not bridged across it.
     func breakSegment() {
         recording?.accumulator.breakSegment()

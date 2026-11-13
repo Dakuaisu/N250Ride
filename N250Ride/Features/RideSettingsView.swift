@@ -5,6 +5,7 @@ struct RideSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var showRecoveryDisclosure = false
+    @State private var confirmingRecoveryDiscard = false
 
     var body: some View {
         @Bindable var model = model
@@ -60,6 +61,10 @@ struct RideSettingsView: View {
                     if let problem = model.recovery.problem {
                         Text(problem).font(.footnote).foregroundStyle(.orange)
                     }
+                    if model.recovery.isBlocked {
+                        Button("Discard saved ride", role: .destructive) { confirmingRecoveryDiscard = true }
+                            .accessibilityIdentifier("discardRecoveryFileButton")
+                    }
                 } header: {
                     Text("Ride recovery")
                 } footer: {
@@ -72,6 +77,10 @@ struct RideSettingsView: View {
                         .accessibilityIdentifier("historyToggle")
                     NavigationLink("Ride history") { RideHistoryView() }
                         .accessibilityIdentifier("historyLink")
+                    if model.history.isBlocked {
+                        Text("Stored history can't be read. Open Ride history to discard it.")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
                 } header: {
                     Text("History")
                 } footer: {
@@ -91,6 +100,10 @@ struct RideSettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .confirmationDialog("Discard the saved ride? It can't be read by this version.",
+                                isPresented: $confirmingRecoveryDiscard, titleVisibility: .visible) {
+                Button("Discard", role: .destructive) { model.discardRecovery() }
             }
             .alert("Keep interrupted rides?", isPresented: $showRecoveryDisclosure) {
                 Button("Turn on") { model.recovery.setEnabled(true) }
@@ -117,6 +130,7 @@ struct RideSettingsView: View {
 struct RideHistoryView: View {
     @Environment(AppModel.self) private var model
     @State private var confirmingDeleteAll = false
+    @State private var confirmingDiscard = false
 
     var body: some View {
         List {
@@ -138,6 +152,10 @@ struct RideHistoryView: View {
             if let problem = model.history.problem {
                 Text(problem).font(.footnote).foregroundStyle(.orange)
             }
+            if model.history.isBlocked {
+                Button("Discard stored history", role: .destructive) { confirmingDiscard = true }
+                    .accessibilityIdentifier("discardHistoryButton")
+            }
             if !model.history.rides.isEmpty {
                 Section {
                     ShareLink(item: model.history.exportJSON()) { Label("Export summaries", systemImage: "square.and.arrow.up") }
@@ -150,6 +168,10 @@ struct RideHistoryView: View {
         .navigationTitle("Ride history")
         .confirmationDialog("Delete every saved ride?", isPresented: $confirmingDeleteAll, titleVisibility: .visible) {
             Button("Delete all", role: .destructive) { model.history.deleteAll() }
+        }
+        .confirmationDialog("Discard the stored history? It can't be read by this version.",
+                            isPresented: $confirmingDiscard, titleVisibility: .visible) {
+            Button("Discard", role: .destructive) { model.history.discardStored() }
         }
     }
 

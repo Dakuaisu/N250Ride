@@ -141,6 +141,8 @@ final class AppModel {
     @ObservationIgnored private let locationManager = CLLocationManager()
     /// Injectable for tests; reads the app's Core Location authorisation.
     @ObservationIgnored var locationAuthorization: () -> CLAuthorizationStatus = { CLLocationManager().authorizationStatus }
+    /// Injectable for tests; follows a short link's redirects.
+    @ObservationIgnored var expandLink: (URL) async -> URL? = { await LinkExpander.expand($0) }
     @ObservationIgnored private var fixture: FixtureNavigationSource?
     @ObservationIgnored private var lastLinkSummary: DiagnosticsLog.LinkSummary?
     @ObservationIgnored private let liveActivity: RideLiveActivity
@@ -512,10 +514,14 @@ final class AppModel {
         }
         linkMessage = "Opening shared link…"
         Task { [weak self] in
-            let expanded = await LinkExpander.expand(link)
+            let expanded = await self?.expandLink(link)
             guard let self, inbox.item(id) != nil else { return }
             if let expanded, case .place(let coordinate, let name) = MapLinkParser.parse(url: expanded) {
-                inbox.resolve(id, coordinate: coordinate, label: name)
+                // Reopen only once the resolved place is stored; otherwise the link would be expanded again.
+                guard inbox.resolve(id, coordinate: coordinate, label: name) else {
+                    linkMessage = "Found the place, but couldn't save it on this phone. Try again later."
+                    return
+                }
                 openInboxItem(id)
             } else {
                 inbox.setStatus(id, .failed("Couldn't read a location from that link."))
@@ -677,6 +683,16 @@ final class AppModel {
             reason: reason, alternatives: opensPreview,
             fix: fix ?? (reason == .initial ? .initial : .current))
         provider.prepareRoute(request) { [weak self] result in self?.prepared(id, result) }
+    }
+
+    /// Cancels and releases the calculation in flight, if any, and clears its status.
+    private func retireOperation() {
+        if let op = operation {
+            provider?.cancelPreparation(op.id)
+            finishOperation(op)
+            record(.routeRequest(.cancelled))
+        }
+        routeOperation = .idle
     }
 
     private func finishOperation(_ op: Operation) {
@@ -873,7 +889,7 @@ final class AppModel {
     /// Recalculate from where the rider is now. Automatic triggers and repeated taps
     /// share the one in-flight calculation; the gate's cooldown still applies.
     func requestReroute(_ reason: RouteReason = .manual) {
-        guard case .navigating(let pending) = stage, let ride, coordinator.session != nil else { return }
+        guard case .navigating(let pending) = stage, let ride, coordinator.session != nil, !arrivalFinalized else { return }
         if operation != nil { return }
         if reason == .offRoute, case .failed = routeOperation {
             // A failed automatic reroute is retried only by the rider.
@@ -1026,12 +1042,7 @@ final class AppModel {
             // End leg one completely: no calculation, no session, cleared dashboard,
             // nothing spoken for it. A reroute still running for leg one is retired
             // here so its gate ticket can't hold up Continue.
-            if let op = operation {
-                provider?.cancelPreparation(op.id)
-                finishOperation(op)
-                record(.routeRequest(.cancelled))
-            }
-            routeOperation = .idle
+            retireOperation()
             fixture?.stop()
             fixture = nil
             provider?.stop()
@@ -1039,11 +1050,14 @@ final class AppModel {
             voice.reset()
             self.ride = next
             history.breakSegment()
+            history.checkpoint(now: clock.wallNow)
             recovery.commit(next, startedAt: rideStartedAt ?? clock.wallNow, now: clock.wallNow)
             guidance = nil
             stage = .atStop(Self.pending(for: next))
         case .completed:
             arrivalFinalized = true
+            // Arrived: any recalculation still running is obsolete and must not commit afterwards.
+            retireOperation()
             if mode == .live {
                 history.finish(.completed, now: clock.wallNow)
                 recovery.finish(ride.id, now: clock.wallNow)
@@ -1075,6 +1089,8 @@ final class AppModel {
         recovery.clearPendingStart()
         if context.phase == .atStop {
             ride = context
+            // Leg two continues the recording only if leg one was being recorded under current consent.
+            history.resume(context.id, now: clock.wallNow)
             recoveryOffer = nil
             stage = .atStop(Self.pending(for: context))
             updateHealth()

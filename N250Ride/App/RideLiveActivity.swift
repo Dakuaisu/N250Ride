@@ -56,19 +56,24 @@ final class ActivityKitSink: ActivitySink {
 /// another on a single chain, so a late update can never overwrite End. Content is
 /// derived from ride health: no direction is shown unless guidance is current.
 ///
-/// The stale date is part of what is submitted. A newer measurement renews it even
-/// when the visible text is unchanged, at most every `renewalInterval` (inside the
-/// five-second evidence lifetime). The display throttle (longer in energy saving)
-/// only delays text changes, and a delayed change or renewal is still delivered.
+/// Two independent clocks decide when to submit:
+/// - freshness: a newer measurement's stale date is submitted at most every
+///   `renewalInterval` (inside the five-second evidence lifetime), even when the
+///   text is unchanged or a text change is still being held back;
+/// - text: changes are throttled to `minimumInterval` (longer in energy saving);
+///   warnings and symbol changes go out at once. A held change that becomes equal
+///   to what is shown again is dropped.
 @MainActor
 final class RideLiveActivity {
     private typealias State = RideActivityAttributes.ContentState
 
     private var activityID: String?
-    private var lastState: State?
-    private var lastStaleDate: Date?
-    private var lastUpdate = Date.distantPast
-    private var deferred: (state: State, staleDate: Date?)?
+    private var shownState: State?
+    private var shownStaleDate: Date?
+    private var lastSubmit = Date.distantPast
+    private var lastTextChange = Date.distantPast
+    private var pendingText: State?
+    private var latestStaleDate: Date?
     private var flush: TimerToken?
     private var chain: Task<Void, Never>?
     private let enabled: Bool
@@ -92,44 +97,40 @@ final class RideLiveActivity {
         let initial = State(symbol: "location.north.line", headline: "Starting…", detail: destination, arrival: nil,
                             remaining: "", warning: false)
         activityID = sink.start(destination: destination, state: initial)
-        lastState = initial
-        lastStaleDate = nil
-        lastUpdate = now()
+        shownState = initial
+        shownStaleDate = nil
+        latestStaleDate = nil
+        lastSubmit = now()
+        lastTextChange = lastSubmit
     }
 
     /// `staleDate` is when the current position stops being evidence.
     func update(_ snapshot: NavigationSnapshot, health: RideHealth, linkReady: Bool, staleDate: Date?) {
-        guard activityID != nil, let shown = lastState else { return }
+        guard activityID != nil, let shown = shownState else { return }
         let state = Self.state(for: snapshot, health: health, linkReady: linkReady)
         let time = now()
-        let since = time.timeIntervalSince(lastUpdate)
-        let renews = staleDate.map { new in lastStaleDate.map { new > $0 } ?? true } ?? false
-        if state != shown {
-            let urgent = state.symbol != shown.symbol || state.warning != shown.warning
-            if urgent || since >= minimumInterval {
-                return submit(state, staleDate: staleDate, at: time)
-            }
-            // Text change throttled: keep it for later, but never let freshness lapse meanwhile.
-            schedule(state, staleDate: staleDate, at: lastUpdate.addingTimeInterval(minimumInterval), from: time)
-            if renews, since >= Self.renewalInterval { renew(shown, staleDate: staleDate, at: time) }
-            return
-        }
-        guard renews else { return }
-        if since >= Self.renewalInterval {
-            submit(state, staleDate: staleDate, at: time)
+        if let staleDate, latestStaleDate.map({ staleDate > $0 }) ?? true { latestStaleDate = staleDate }
+        if staleDate == nil { latestStaleDate = nil }
+        if state == shown {
+            pendingText = nil
+        } else if state.symbol != shown.symbol || state.warning != shown.warning {
+            pendingText = nil
+            return submit(state, at: time)
         } else {
-            schedule(state, staleDate: staleDate, at: lastUpdate.addingTimeInterval(Self.renewalInterval), from: time)
+            pendingText = state
         }
+        reconcile(at: time)
     }
 
     func end() {
         flush?.cancel()
         flush = nil
-        deferred = nil
+        pendingText = nil
         guard let id = activityID else { return }
         activityID = nil
-        lastState = nil
-        lastStaleDate = nil
+        shownState = nil
+        shownStaleDate = nil
+        latestStaleDate = nil
         enqueue { [sink] in await sink.end(id) }
     }
 
@@ -144,32 +145,44 @@ final class RideLiveActivity {
         await chain?.value
     }
 
-    private func submit(_ state: State, staleDate: Date?, at time: Date) {
+    private var needsRenewal: Bool {
+        guard let latestStaleDate else { return false }
+        return shownStaleDate.map { latestStaleDate > $0 } ?? true
+    }
+
+    /// Submits whatever is due now and schedules one wake for the next due item.
+    private func reconcile(at time: Date) {
         flush?.cancel()
         flush = nil
-        deferred = nil
-        renew(state, staleDate: staleDate, at: time)
-    }
-
-    private func renew(_ state: State, staleDate: Date?, at time: Date) {
-        guard let id = activityID else { return }
-        lastState = state
-        lastStaleDate = staleDate
-        lastUpdate = time
-        updates += 1
-        enqueue { [sink] in await sink.update(id, state: state, staleDate: staleDate) }
-    }
-
-    private func schedule(_ state: State, staleDate: Date?, at due: Date, from time: Date) {
-        deferred = (state, staleDate)
-        guard flush == nil else { return }
+        guard activityID != nil, let shown = shownState else { return }
+        let textDue = pendingText.map { _ in lastTextChange.addingTimeInterval(minimumInterval) }
+        let renewalDue = needsRenewal ? lastSubmit.addingTimeInterval(Self.renewalInterval) : nil
+        if let pending = pendingText, let textDue, time >= textDue {
+            pendingText = nil
+            return submit(pending, at: time)
+        }
+        if let renewalDue, time >= renewalDue {
+            return submit(shown, at: time, textChanged: false)
+        }
+        guard let due = [textDue, renewalDue].compactMap({ $0 }).min() else { return }
         let delay = max(due.timeIntervalSince(time), 0)
         flush = timers.schedule(after: .milliseconds(Int((delay * 1_000).rounded(.up)))) { [weak self] in
             guard let self else { return }
             self.flush = nil
-            guard let deferred = self.deferred else { return }
-            self.submit(deferred.state, staleDate: deferred.staleDate, at: self.now())
+            self.reconcile(at: self.now())
         }
+    }
+
+    private func submit(_ state: State, at time: Date, textChanged: Bool = true) {
+        guard let id = activityID else { return }
+        let staleDate = latestStaleDate
+        shownState = state
+        shownStaleDate = staleDate
+        lastSubmit = time
+        if textChanged { lastTextChange = time }
+        updates += 1
+        enqueue { [sink] in await sink.update(id, state: state, staleDate: staleDate) }
+        if pendingText != nil { reconcile(at: time) }
     }
 
     private func enqueue(_ work: @escaping @MainActor () async -> Void) {
