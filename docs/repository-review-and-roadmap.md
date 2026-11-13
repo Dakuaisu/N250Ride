@@ -701,3 +701,21 @@ check was made, so every device gate in sections 6 and 8 remains open.
 
 Not done (recommendations, not defects): performance items R11, features N1-N10, the Bluetooth platform seam
 (callback routing logic is tested in core, not through a fake `CBPeripheral`), and the App Group (N8, owner gate).
+
+### Second review round (2026-11-13)
+
+A follow-up review of the fixes found eight further issues; all were confirmed and fixed, each with a test in
+`SecondReviewRegressionTests`. Verified: 157 core tests and 99 app unit tests pass; the 14 simulation UI tests
+pass (two needed a rerun because of keyboard/toggle timing under a heavily loaded Mac, in screens this round
+did not change). No device checks.
+
+| # | Issue | Fix |
+| --- | --- | --- |
+| 1 | Test audio replaced the tracked prompt without stopping a speaking turn | Test audio stops the current turn and drops the pending one before speaking. |
+| 2 | A failed save of a resolved short link reopened the item, expanding the link again (repeatedly) | Reopen only after the resolved place is stored; otherwise show a storage message and stop. Link expansion is injectable for tests. |
+| 3 | Ending a ride deleted an unreadable (preserved) recovery file | `finish` keeps a blocked journal; only an explicit discard removes it. |
+| 4 | Resuming at the stop after a restart lost leg two from history | Resume at the stop continues the recording (consent-checked), and the totals are saved on reaching the stop. |
+| 5 | A reroute still running at final arrival could commit afterwards | Final arrival retires the operation; no recalculation after arriving. |
+| 6 | Throttled Live Activity text could delay freshness renewal; a change back to the shown text stayed queued | Freshness renewal and text throttling are scheduled independently; returning to the shown text drops the held change. |
+| 7 | Unreadable inbox/history/recovery data could not be discarded from the app | Confirmation-backed Discard buttons in Waiting destinations, Ride history and Ride settings. |
+| 8 | The pump didn't wait for an outstanding console write; unacknowledged console writes ignored readiness | The pump holds a channel while a console write on it awaits its answer; console writes time out after 3 s (link retired) and unacknowledged ones respect Bluetooth readiness. Production callback interleaving remains a device gate. |
