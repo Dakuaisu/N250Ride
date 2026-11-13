@@ -8,8 +8,11 @@ enum ShareInbox {
     private static let name = UIPasteboard.Name("com.n250ride.share-inbox")
     private static let type = "public.utf8-plain-text"
 
-    static func put(_ text: String) {
-        UIPasteboard(name: name, create: true)?.setValue(text, forPasteboardType: type)
+    /// False when the hand-off couldn't be written.
+    static func put(_ text: String) -> Bool {
+        guard let board = UIPasteboard(name: name, create: true) else { return false }
+        board.setValue(text, forPasteboardType: type)
+        return board.value(forPasteboardType: type) as? String == text
     }
 
     static func peek() -> String? {

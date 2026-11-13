@@ -55,7 +55,7 @@ struct BluetoothConsoleView: View {
             } header: {
                 Text("Send")
             } footer: {
-                Text("Navigation frames are shown for 5 s, then cleared. Other channels get one write. The firmware-update service is always blocked.")
+                Text("Navigation frames are requested for 5 s, then a clear is requested; only you can confirm what the dashboard showed. Other channels get one write. The firmware-update service is always blocked.")
             }
 
             Section {

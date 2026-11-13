@@ -52,7 +52,11 @@ struct BikeSetupView: View {
         case .clear:
             Button("Clear the dashboard") { setup.sendClear() }
                 .accessibilityIdentifier("setupClear")
-            LabeledContent("Bluetooth result", value: setup.report.clearTransport.label)
+            LabeledContent("Bluetooth result", value: setup.clearRequest != nil && setup.report.clearTransport == .notRun
+                           ? "Waiting for the bike" : setup.report.clearTransport.label)
+            Button("Check again") { setup.refreshClear() }
+            Text("This only says whether the bike's Bluetooth accepted the clear, not what the dashboard shows.")
+                .font(.footnote).foregroundStyle(.secondary)
         case .samples:
             ForEach(BikeSetupModel.samples) { sample in
                 VStack(alignment: .leading, spacing: 6) {
@@ -62,8 +66,20 @@ struct BikeSetupView: View {
                 }
             }
         case .stopFrame:
-            Button("Show an arrow, then turn navigation off") { setup.sendStopFrame() }
-            ObservationPicker(title: "Did the arrow disappear?", value: setup.report.stopFrameVisual) { setup.observeStopFrame($0) }
+            Button("1. Show a right-turn arrow") { setup.showArrow() }
+                .accessibilityIdentifier("setupShowArrow")
+            if setup.arrowShown {
+                ObservationPicker(title: "Did the arrow appear?", value: setup.report.arrowAppeared) { setup.observeArrow($0) }
+            }
+            if setup.report.arrowAppeared == .pass {
+                Button("2. Turn navigation off") { setup.turnNavigationOff() }
+                ObservationPicker(title: "Did the arrow disappear?", value: setup.report.stopFrameVisual) {
+                    setup.observeStopFrame($0)
+                }
+            } else if setup.report.arrowAppeared != .notRun {
+                Text("Without seeing the arrow, whether it disappears can't be checked: recorded as inconclusive.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         case .status:
             Text(model.statusProfile == nil
                  ? "The app isn't sending phone status. Skip this step, or pick a profile in Diagnostics first."
@@ -81,6 +97,7 @@ struct BikeSetupView: View {
             ForEach(BikeSetupModel.samples) { sample in
                 LabeledContent(sample.label, value: (setup.report.samples[sample.id] ?? .notRun).label)
             }
+            LabeledContent("Test arrow (seen)", value: setup.report.arrowAppeared.label)
             LabeledContent("Navigation off (seen)", value: setup.report.stopFrameVisual.label)
             LabeledContent("Phone status (seen)", value: setup.report.statusVisual.label)
             LabeledContent("Reconnect", value: setup.report.reconnect.label)

@@ -91,7 +91,7 @@ final class BluetoothConsole {
             }
             let frame = fixChecksum ? Self.withChecksum(bytes) : bytes
             if let problem = host?.sendConsoleFrame(frame) { return log(.error, target, problem) }
-            return log(.sent, target, HexBytes.format(frame) + "  (shown for 5 s)")
+            return log(.sent, target, HexBytes.format(frame) + "  (test requested for 5 s)")
         }
         let known = Self.knownTargets.contains { $0.id == target }
         if !known, !confirmed {
@@ -102,14 +102,14 @@ final class BluetoothConsole {
         if let problem = bike.rawWrite(bytes, to: target, withResponse: withResponse) {
             return log(.error, target, problem)
         }
-        log(.sent, target, HexBytes.format(bytes))
+        log(.sent, target, HexBytes.format(bytes) + (withResponse ? "  (waiting for the bike)" : ""))
     }
 
     func clearDashboard() {
         if let reason = host?.clearTestFrame() {
             return log(.error, ClusterGATT.navigation, "Refused: \(reason)")
         }
-        log(.info, ClusterGATT.navigation, "Clear sent")
+        log(.info, ClusterGATT.navigation, "Clear requested")
     }
 
     func run(_ preset: Preset) {
@@ -187,7 +187,10 @@ final class BluetoothConsole {
     private func handle(_ event: ConsoleLinkEvent) {
         switch event {
         case .wrote(let channel, let error):
-            log(error == nil ? .info : .error, channel, error.map { "Write failed: \($0)" } ?? "Write acknowledged")
+            log(error == nil ? .info : .error, channel,
+                error.map { "Bike rejected the write: \($0)" } ?? "Bike acknowledged the write (not proof it was shown)")
+        case .submitted(let channel):
+            log(.info, channel, "Handed to Bluetooth; this channel gives no acknowledgement")
         case .read(let channel, let bytes, let error):
             if let error { return log(.error, channel, "Read failed: \(error)") }
             let bytes = bytes ?? []

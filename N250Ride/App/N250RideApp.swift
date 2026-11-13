@@ -12,7 +12,10 @@ struct N250RideApp: App {
                 .onOpenURL { model.handleOpenURL($0) }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { model.checkShareInbox() }
+            guard phase == .active else { return }
+            // Safety first: overdue freshness/clear deadlines are processed before anything new is shown.
+            model.foregroundSafetyCheck()
+            model.checkShareInbox()
         }
     }
 }

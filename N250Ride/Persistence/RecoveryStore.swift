@@ -18,9 +18,9 @@ final class RecoveryStore {
     private static let enabledKey = "recoveryEnabled"
     private static let finishedKey = "recoveryFinishedRides"
 
-    init(directory: URL, defaults: UserDefaults) {
+    init(directory: URL, defaults: UserDefaults, io: RecordIO = .real) {
         file = RecordFile(directory: directory, name: "recovery.json", schemaVersion: RecoveryJournal.schemaVersion,
-                          maxBytes: 64 * 1_024)
+                          maxBytes: 64 * 1_024, io: io)
         self.defaults = defaults
         enabled = defaults.bool(forKey: Self.enabledKey)
     }
@@ -90,9 +90,11 @@ final class RecoveryStore {
     private func write() {
         do {
             try file.save(journal)
-            problem = nil
+            problem = file.backupExclusionFailed ? "The saved ride may be included in phone backups." : nil
         } catch {
-            problem = "Ride recovery unavailable: the ride couldn't be saved."
+            problem = file.blocked == nil
+                ? "Ride recovery unavailable: the ride couldn't be saved."
+                : "A saved ride can't be read, so nothing new is saved. Discard it to use recovery."
         }
     }
 

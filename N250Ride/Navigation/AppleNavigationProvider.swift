@@ -16,7 +16,6 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
     var onLongPress: ((Coordinate) -> Void)?
     var onRerouteNeeded: (() -> Void)?
     var onFix: ((AdmittedFix) -> Void)?
-    var routePreferences = RoutePreferences()
 
     let name = "Apple Maps"
     let routingLabel = "Apple Maps car route - Apple has no motorcycle routing"
@@ -45,6 +44,7 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
 
     private struct FixWaiter {
         let id: UUID
+        let owner: LocationOwner
         let requirement: FixRequirement
         let completion: (LocationSample?) -> Void
         let timeout: TimerToken
@@ -109,7 +109,7 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
         let operation = request.operationID
         pendingOperation = operation
         acquire(.acquisition(operation))
-        awaitFix(request.fix) { [weak self] sample in
+        awaitFix(request.fix, owner: .acquisition(operation)) { [weak self] sample in
             guard let self, self.pendingOperation == operation else { return }
             guard let sample else {
                 self.finishOperation(operation)
@@ -164,8 +164,9 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
             return
         }
         let owner = LocationOwner.acquisition(handle.id)
+        dropWaiters(of: owner)
         acquire(owner)
-        awaitFix(.current) { [weak self] sample in
+        awaitFix(.current, owner: owner) { [weak self] sample in
             self?.release(owner)
             guard let sample else { return completion(.noCurrentFix) }
             let moved = sample.coordinate.distance(to: p.origin)
@@ -187,10 +188,17 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
     func cancelPreparation(_ operationID: UUID) {
         guard pendingOperation == operationID else { return }
         directions.cancel()
+        dropWaiters(of: .acquisition(operationID))
         finishOperation(operationID)
     }
 
+    func cancelStartCheck(_ handle: PreparedRouteHandle) {
+        dropWaiters(of: .acquisition(handle.id))
+        release(.acquisition(handle.id))
+    }
+
     func discardPrepared(_ handle: PreparedRouteHandle) {
+        cancelStartCheck(handle)
         prepared[handle] = nil
         if previewing?.handle == handle {
             previewing = nil
@@ -273,7 +281,8 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
 
     /// Calls back with a sample meeting `requirement`, or nil after 15 s. Each wait
     /// has its own timeout, so an old timeout can never drain a newer wait.
-    private func awaitFix(_ requirement: FixRequirement, _ completion: @escaping (LocationSample?) -> Void) {
+    private func awaitFix(_ requirement: FixRequirement, owner: LocationOwner,
+                          _ completion: @escaping (LocationSample?) -> Void) {
         if let lastSample, requirement.accepts(lastSample, now: clock.wallNow) {
             completion(lastSample)
             return
@@ -285,9 +294,20 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
             self.updateLocationRunning()
             waiter.completion(nil)
         }
-        waiters.append(FixWaiter(id: id, requirement: requirement, completion: completion, timeout: timeout))
+        waiters.append(FixWaiter(id: id, owner: owner, requirement: requirement, completion: completion, timeout: timeout))
         updateLocationRunning()
     }
+
+    /// A cancelled acquisition: its waits end now (without answering) and stop holding GPS.
+    private func dropWaiters(of owner: LocationOwner) {
+        let dropped = waiters.filter { $0.owner == owner }
+        guard !dropped.isEmpty else { return }
+        waiters.removeAll { $0.owner == owner }
+        dropped.forEach { $0.timeout.cancel() }
+        updateLocationRunning()
+    }
+
+    var hasPendingFixWait: Bool { !waiters.isEmpty }
 
     private func serveWaiters(with sample: LocationSample) {
         let now = clock.wallNow

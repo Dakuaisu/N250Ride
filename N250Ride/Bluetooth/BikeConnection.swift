@@ -24,7 +24,10 @@ struct GattServiceInfo: Identifiable, Equatable {
 
 /// Results of console operations, reported back to the Bluetooth console.
 enum ConsoleLinkEvent {
+    /// The bike acknowledged (or rejected) an acknowledged write.
     case wrote(characteristic: String, error: String?)
+    /// Handed to Bluetooth without any acknowledgement from the bike.
+    case submitted(characteristic: String)
     case read(characteristic: String, bytes: [UInt8]?, error: String?)
     case explored([GattServiceInfo])
 }
@@ -46,7 +49,7 @@ final class BikeConnection: NSObject {
     private(set) var gattServices: [GattServiceInfo] = []
     @ObservationIgnored var onConsoleEvent: ((ConsoleLinkEvent) -> Void)?
     @ObservationIgnored private var exploring = false
-    @ObservationIgnored private var pendingRawWrites: Set<String> = []
+    @ObservationIgnored private var router = WriteCompletionRouter()
 
     @ObservationIgnored private let coordinator: SessionCoordinator
     @ObservationIgnored private let clock: RideClock
@@ -197,9 +200,13 @@ final class BikeConnection: NSObject {
         guard canWrite else { return "This channel doesn't accept \(withResponse ? "acknowledged" : "unacknowledged") writes." }
         let maximum = peripheral.maximumWriteValueLength(for: type)
         guard bytes.count <= maximum else { return "Too long: \(bytes.count) bytes, the bike accepts at most \(maximum)." }
-        if withResponse { pendingRawWrites.insert(characteristic.uuid.uuidString.uppercased()) }
+        if withResponse {
+            guard case .success = router.beginRaw(characteristic.uuid.uuidString, pumpBusyOn: pump?.inFlightChannel) else {
+                return "The app's own write on this channel is still waiting for the bike. Try again in a moment."
+            }
+        }
         peripheral.writeValue(Data(bytes), for: characteristic, type: type)
-        if !withResponse { onConsoleEvent?(.wrote(characteristic: uuid, error: nil)) }
+        if !withResponse { onConsoleEvent?(.submitted(characteristic: uuid)) }
         return nil
     }
 
@@ -296,7 +303,7 @@ final class BikeConnection: NSObject {
         discoveryTimeout?.cancel()
         if retire { lifecycle.retire() }
         exploring = false
-        pendingRawWrites = []
+        router.reset()
         gattServices = []
         coordinator.linkLost()
         pump = nil
@@ -404,7 +411,9 @@ extension BikeConnection: CBCentralManagerDelegate {
 
 extension BikeConnection: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        let id = peripheral.identifier
         MainActor.assumeIsolated {
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
             // Once the link is up, discovery only serves the console's service list.
             if state.isReady {
                 for service in self.peripheral?.services ?? [] {
@@ -426,7 +435,9 @@ extension BikeConnection: CBPeripheralDelegate {
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                                 error: Error?) {
+        let id = peripheral.identifier
         MainActor.assumeIsolated {
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
             if state.isReady {
                 recordGatt()
                 return
@@ -459,29 +470,40 @@ extension BikeConnection: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
                                 error: Error?) {
         let uuid = characteristic.uuid.uuidString.uppercased()
-        let isNavigation = uuid == ClusterGATT.navigation
+        let id = peripheral.identifier
         let message = error?.localizedDescription
         MainActor.assumeIsolated {
-            if pendingRawWrites.remove(uuid) != nil {
+            // Only the current bike's answers count; anything else belongs to a link that's gone.
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
+            switch router.complete(uuid) {
+            case .raw:
                 onConsoleEvent?(.wrote(characteristic: uuid, error: message))
-                return
+            case .pump(let channel):
+                pump?.didCompleteWrite(on: channel, success: message == nil)
+            case .none:
+                break
             }
-            pump?.didCompleteWrite(on: isNavigation ? .navigation : .status, success: message == nil)
         }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                                 error: Error?) {
         let uuid = characteristic.uuid.uuidString
+        let id = peripheral.identifier
         let bytes = characteristic.value.map { [UInt8]($0) }
         let message = error?.localizedDescription
         MainActor.assumeIsolated {
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
             onConsoleEvent?(.read(characteristic: uuid, bytes: bytes, error: message))
         }
     }
 
     nonisolated func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-        MainActor.assumeIsolated { pump?.transportReadyForWriteWithoutResponse() }
+        let id = peripheral.identifier
+        MainActor.assumeIsolated {
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
+            pump?.transportReadyForWriteWithoutResponse()
+        }
     }
 
     private static func properties(_ p: CBCharacteristicProperties) -> CharacteristicProperties {

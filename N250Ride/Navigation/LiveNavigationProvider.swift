@@ -70,7 +70,6 @@ protocol LiveNavigationProvider: AnyObject {
     var onRerouteNeeded: (() -> Void)? { get set }
     /// Every accepted, genuinely new position while guiding.
     var onFix: ((AdmittedFix) -> Void)? { get set }
-    var routePreferences: RoutePreferences { get set }
 
     var name: String { get }
     /// Shown on the route preview, e.g. which vehicle profile the route uses.
@@ -97,6 +96,8 @@ protocol LiveNavigationProvider: AnyObject {
     func commitPreparedRoute(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool
     /// Abandons an in-flight calculation; its answer, if it still comes, is ignored.
     func cancelPreparation(_ operationID: UUID)
+    /// Abandons a pending Start position check without answering it.
+    func cancelStartCheck(_ handle: PreparedRouteHandle)
     func discardPrepared(_ handle: PreparedRouteHandle)
     /// Follow the rider, or show the whole route before guidance starts.
     func recenter()

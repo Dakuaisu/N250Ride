@@ -1,4 +1,4 @@
-// Tracked defaults: no-key simulation, no proven status profile.
+// Tracked defaults: Apple Maps routing (no key), Google disabled, no proven status profile.
 N250_BUNDLE_ID = com.n250ride.app
 // apple (MapKit car routing) or google (needs the SDK packages re-enabled in project.yml)
 N250_NAV_PROVIDER = apple

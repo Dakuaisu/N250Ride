@@ -24,18 +24,29 @@ final class ShareViewController: UIViewController {
         Task { await collect(providers) }
     }
 
+    /// At most this many attachments are read; each is cut to the parser's size limit.
+    static let maxProviders = 8
+
     private func collect(_ providers: [NSItemProvider]) async {
         var texts: [String] = []
-        for provider in providers {
-            if let text = await Self.text(from: provider) { texts.append(text) }
+        for provider in providers.prefix(Self.maxProviders) {
+            guard let text = await Self.text(from: provider) else { continue }
+            let bounded = String(text.utf8.prefix(MapLinkParser.maxInputBytes)) ?? ""
+            if MapLinkParser.parse(bounded) != nil {
+                return deliver(bounded)
+            }
+            texts.append(bounded)
         }
-        let candidates = texts + [texts.joined(separator: " ")]
-        if let found = candidates.first(where: { MapLinkParser.parse($0) != nil }) {
-            ShareInbox.put(found)
-            status.result = .sent
+        let joined = String(texts.joined(separator: " ").utf8.prefix(MapLinkParser.maxInputBytes)) ?? ""
+        if MapLinkParser.parse(joined) != nil {
+            deliver(joined)
         } else {
             status.result = .noLocation
         }
+    }
+
+    private func deliver(_ text: String) {
+        status.result = ShareInbox.put(text) ? .sent : .failed
     }
 
     private static func text(from provider: NSItemProvider) async -> String? {
@@ -54,7 +65,7 @@ final class ShareViewController: UIViewController {
 @MainActor
 @Observable
 final class ShareStatus {
-    enum Result { case working, sent, noLocation }
+    enum Result { case working, sent, noLocation, failed }
     var result = Result.working
 }
 
@@ -71,6 +82,12 @@ struct ShareView: View {
                 Image(systemName: "checkmark.circle.fill").font(.system(size: 56)).foregroundStyle(.green)
                 Text("Sent to N250 Ride").font(.title2.weight(.semibold))
                 Text("Open N250 Ride soon to keep it: until the app opens, a phone restart can lose it.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 56)).foregroundStyle(.orange)
+                Text("Couldn't hand it to N250 Ride").font(.title2.weight(.semibold))
+                Text("Copy the link and paste it in N250 Ride instead.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
             case .noLocation:

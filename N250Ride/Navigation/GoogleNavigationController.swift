@@ -17,12 +17,6 @@ final class GoogleNavigationController: NSObject, LiveNavigationProvider {
     var onLongPress: ((Coordinate) -> Void)?
     /// Unused: the Navigation SDK reroutes by itself at no extra destination charge.
     var onRerouteNeeded: (() -> Void)?
-    var routePreferences = RoutePreferences() {
-        didSet {
-            mapView.navigator?.avoidsTolls = routePreferences.avoidTolls
-            mapView.navigator?.avoidsHighways = routePreferences.avoidHighways
-        }
-    }
 
     let name = "Google"
     let routingLabel = "Google two-wheeler route with traffic"
@@ -115,6 +109,8 @@ final class GoogleNavigationController: NSObject, LiveNavigationProvider {
             return
         }
         pendingSession = (request.session, request.generation)
+        navigator.avoidsTolls = request.preferences.avoidTolls
+        navigator.avoidsHighways = request.preferences.avoidHighways
         lastFields = nil
         mapView.travelMode = .twoWheeler
         navigator.setDestinations([waypoint]) { routeDescription, error in
@@ -157,6 +153,8 @@ final class GoogleNavigationController: NSObject, LiveNavigationProvider {
     }
 
     func cancelPreparation(_ operationID: UUID) {}
+
+    func cancelStartCheck(_ handle: PreparedRouteHandle) {}
 
     func discardPrepared(_ handle: PreparedRouteHandle) {
         guard handle == prepared else { return }

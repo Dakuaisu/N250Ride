@@ -262,7 +262,7 @@ private struct Navigating: View {
         } header: {
             Text("To \(RideView.title(pending))")
         } footer: {
-            DashboardIntentView(intent: model.intent)
+            DashboardIntentView(intent: model.intent, delivery: model.dashboardDelivery)
         }
 
         if !model.inbox.waiting.isEmpty {
@@ -388,16 +388,33 @@ struct TurnCard: View {
     }
 }
 
-/// What the bike's dashboard is showing, in one line.
+/// What the app asked the dashboard to show and what the Bluetooth link reported,
+/// in one line. Only the rider can confirm what the dashboard actually displays.
 struct DashboardIntentView: View {
     let intent: DashboardIntent
+    var delivery: DashboardDelivery = .linkDown
 
     var body: some View {
+        Label(Self.text(intent, delivery), systemImage: {
+            if case .guidance = intent { return "gauge.with.dots.needle.67percent" }
+            return "gauge.with.dots.needle.0percent"
+        }())
+    }
+
+    static func text(_ intent: DashboardIntent, _ delivery: DashboardDelivery) -> String {
+        let status = switch delivery {
+        case .linkDown: "bike not connected"
+        case .clearPending: "waiting for the bike"
+        case .clearTransportAcknowledged: "bike acknowledged"
+        case .clearHandedOffWithoutResponse: "sent, not acknowledged"
+        case .guidanceSubmitted: "sent"
+        case .deliveryUncertain: "delivery uncertain"
+        }
         switch intent {
         case .guidance(let fields, _):
-            Label("Dashboard: \(ClusterIcon.name(fields.icon))", systemImage: "gauge.with.dots.needle.67percent")
+            return "Dashboard: \(ClusterIcon.name(fields.icon)) (\(status))"
         case .clear(let reason):
-            Label("Dashboard cleared - \(Self.describe(reason))", systemImage: "gauge.with.dots.needle.0percent")
+            return "Dashboard clear requested - \(describe(reason)) (\(status))"
         }
     }
 

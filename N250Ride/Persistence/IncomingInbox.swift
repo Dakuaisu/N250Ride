@@ -46,17 +46,35 @@ final class IncomingInbox {
 
     private(set) var items: [IncomingDestination] = []
     private(set) var problem: String?
+    /// The stored list couldn't be read and is kept untouched until discarded.
+    private(set) var isBlocked = false
     @ObservationIgnored private let file: RecordFile<[IncomingDestination]>
 
-    init(directory: URL, now: Date) {
-        file = RecordFile(directory: directory, name: "inbox.json", schemaVersion: 1, maxBytes: 64 * 1_024)
+    init(directory: URL, now: Date, io: RecordIO = .real) {
+        file = RecordFile(directory: directory, name: "inbox.json", schemaVersion: 1, maxBytes: 64 * 1_024, io: io)
         do {
             items = try file.load() ?? []
+        } catch .unknownSchema {
+            isBlocked = true
+            problem = "Saved destinations are from a newer version of the app. Discard them to save new ones."
         } catch {
-            problem = "Saved destinations couldn't be read."
+            isBlocked = true
+            problem = "Saved destinations couldn't be read. Discard them to save new ones."
         }
         for index in items.indices where items[index].status == .reserved { items[index].status = .pending }
         prune(now: now)
+    }
+
+    /// Explicitly throws away an unreadable stored list.
+    func discardStored() {
+        do {
+            try file.delete()
+            items = []
+            isBlocked = false
+            problem = nil
+        } catch {
+            problem = "Couldn't remove the saved destinations."
+        }
     }
 
     var waiting: [IncomingDestination] { items.filter { $0.status != .reserved } }
@@ -82,7 +100,8 @@ final class IncomingInbox {
 
     func item(_ id: UUID) -> IncomingDestination? { items.first { $0.id == id } }
 
-    func resolve(_ id: UUID, coordinate: Coordinate, label: String?) {
+    @discardableResult
+    func resolve(_ id: UUID, coordinate: Coordinate, label: String?) -> Bool {
         update(id) {
             $0.coordinate = coordinate
             $0.link = nil
@@ -90,16 +109,21 @@ final class IncomingInbox {
         }
     }
 
-    func setStatus(_ id: UUID, _ status: IncomingDestination.Status) {
+    /// False when the change could not be stored; memory then keeps the old state.
+    @discardableResult
+    func setStatus(_ id: UUID, _ status: IncomingDestination.Status) -> Bool {
         update(id) { $0.status = status }
     }
 
-    /// The ride for this item has started: it is consumed.
-    func consume(_ id: UUID) {
+    /// The ride for this item has started: it is consumed. If that can't be stored the
+    /// item stays (accepted, shown with Try again) rather than silently returning later.
+    @discardableResult
+    func consume(_ id: UUID) -> Bool {
         remove(id)
     }
 
-    func discard(_ id: UUID) {
+    @discardableResult
+    func discard(_ id: UUID) -> Bool {
         remove(id)
     }
 
@@ -109,25 +133,36 @@ final class IncomingInbox {
         if items.count != before { _ = save() }
     }
 
-    private func update(_ id: UUID, _ change: (inout IncomingDestination) -> Void) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+    private func update(_ id: UUID, _ change: (inout IncomingDestination) -> Void) -> Bool {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return false }
+        let before = items
         change(&items[index])
-        _ = save()
+        guard save() else {
+            items = before
+            return false
+        }
+        return true
     }
 
-    private func remove(_ id: UUID) {
+    private func remove(_ id: UUID) -> Bool {
+        let before = items
         items.removeAll { $0.id == id }
-        _ = save()
+        guard save() else {
+            items = before
+            return false
+        }
+        return true
     }
 
     @discardableResult
     private func save() -> Bool {
+        guard !isBlocked else { return false }
         do {
             try file.save(items)
-            problem = nil
+            problem = file.backupExclusionFailed ? "Saved destinations may be included in phone backups." : nil
             return true
         } catch {
-            problem = "Saved destinations couldn't be stored."
+            problem = "Saved destinations couldn't be stored. The change was not kept."
             return false
         }
     }

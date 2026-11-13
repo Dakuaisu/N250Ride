@@ -34,6 +34,10 @@ protocol AudioSessionClient: AnyObject {
 /// or the phone speaker when allowed). Holds at most the prompt being spoken and one
 /// pending prompt; anything for another route or after a hold is dropped, never
 /// replayed. Calls, interruptions and a lost headset each hold speech independently.
+///
+/// A turn prompt is spoken only while it is still true: same route and maneuver,
+/// guidance eligible, and its position measurement not yet expired. It is checked
+/// again right before speaking, and a turn being spoken is cut off when it stops being true.
 @MainActor
 @Observable
 final class VoiceGuide {
@@ -58,7 +62,7 @@ final class VoiceGuide {
     @ObservationIgnored private var latest: NavigationSnapshot?
     @ObservationIgnored private var nextTag = 0
     @ObservationIgnored private var lastTestAt: MonotonicInstant?
-    @ObservationIgnored private(set) var spoken: [String] = []
+    @ObservationIgnored private var eligible = false
 
     static let testInterval: Duration = .seconds(3)
 
@@ -95,12 +99,21 @@ final class VoiceGuide {
         silence()
     }
 
+    /// Ride health's verdict, updated whenever it changes (including measurement expiry
+    /// with no new snapshot). Losing eligibility drops every turn prompt at once.
+    func setEligible(_ on: Bool) {
+        eligible = on
+        dropObsoleteTurns()
+    }
+
     /// `eligible` is ride health's verdict: turns are spoken only on current guidance.
     func handle(_ snapshot: NavigationSnapshot, eligible: Bool) {
         if let latest, latest.session != snapshot.session || latest.generation != snapshot.generation {
             silence()
         }
         latest = snapshot
+        self.eligible = eligible
+        dropObsoleteTurns()
         // Held or stale turns are not planned at all, so a stage that was never
         // spoken can still be spoken once it is current and allowed again.
         guard enabled, holds.isEmpty, eligible || snapshot.state != .active,
@@ -111,10 +124,14 @@ final class VoiceGuide {
     /// The current instruction again; refused while held or not current.
     func repeatCurrent(eligible: Bool) {
         guard enabled, holds.isEmpty, eligible, let latest, let text = planner.repeatPrompt(for: latest) else { return }
+        self.eligible = eligible
         pending = nil
         if current != nil { speech.stop() }
         current = nil
-        say(VoicePrompt(text: text, priority: .turn, session: latest.session, generation: latest.generation))
+        let prompt = VoicePrompt(text: text, priority: .turn, session: latest.session, generation: latest.generation,
+                                 step: latest.step?.sequence, validUntil: VoicePromptPlanner.validity(latest))
+        guard isCurrent(prompt) else { return }
+        say(prompt)
     }
 
     /// A short sample on the current output, at most once every three seconds.
@@ -158,19 +175,35 @@ final class VoiceGuide {
         activationFailed = false
         nextTag += 1
         current = (nextTag, prompt)
-        spoken.append(prompt.text)
         speech.speak(prompt.text, tag: nextTag)
     }
 
     private func finished(_ tag: Int) {
         guard current?.tag == tag else { return }
         current = nil
-        if let next = pending, holds.isEmpty, let latest,
-           next.session == latest.session && next.generation == latest.generation || next.priority == .status {
-            pending = nil
+        let next = pending
+        pending = nil
+        if let next, holds.isEmpty, isCurrent(next) {
             say(next)
         } else {
-            pending = nil
+            audio.deactivate()
+        }
+    }
+
+    /// Whether a prompt is still true right now. Status prompts stay valid; a turn
+    /// needs eligible guidance on the same route and maneuver and an unexpired measurement.
+    private func isCurrent(_ prompt: VoicePrompt) -> Bool {
+        guard prompt.priority == .turn else { return true }
+        guard eligible, let latest, latest.state == .active, latest.session == prompt.session,
+              latest.generation == prompt.generation, latest.step?.sequence == prompt.step else { return false }
+        return prompt.validUntil.map { clock.now < $0 } ?? true
+    }
+
+    private func dropObsoleteTurns() {
+        if let pending, !isCurrent(pending) { self.pending = nil }
+        if let current, !isCurrent(current.prompt) {
+            self.current = nil
+            speech.stop()
             audio.deactivate()
         }
     }
@@ -234,6 +267,8 @@ final class SystemSpeechClient: NSObject, SpeechClient, AVSpeechSynthesizerDeleg
 
     func stop() {
         synthesizer.stopSpeaking(at: .immediate)
+        // Cancelled utterances may not all report back; their tags are retired here.
+        tags.removeAll()
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {

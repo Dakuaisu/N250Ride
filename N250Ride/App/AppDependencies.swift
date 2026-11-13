@@ -21,10 +21,11 @@ struct AppDependencies {
     var speech: SpeechClient
     var audio: AudioSessionClient
     var liveActivities: Bool
+    var activitySink: ActivitySink
 
     static func live() -> AppDependencies {
         AppDependencies(clock: SystemRideClock(), timers: SystemRideTimers(), storage: StorageLocation.standard,
                         calls: CallMonitor(), speech: SystemSpeechClient(), audio: SystemAudioSessionClient(),
-                        liveActivities: true)
+                        liveActivities: true, activitySink: ActivityKitSink())
     }
 }

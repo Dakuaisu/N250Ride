@@ -9,9 +9,28 @@ enum StoreError: Error, Equatable {
     case corrupt
 }
 
+/// File operations a record needs, replaceable in tests to inject failures.
+struct RecordIO: Sendable {
+    var write: @Sendable (Data, URL) throws -> Void
+    var excludeFromBackup: @Sendable (URL) throws -> Void
+
+    static let real = RecordIO(
+        write: { data, url in try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]) },
+        excludeFromBackup: { url in
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var target = url
+            try target.setResourceValues(values)
+        })
+}
+
 /// One small versioned record in a file under Application Support: atomic
 /// replacement, a size cap, after-first-unlock protection (so a locked phone can
 /// still save during a ride) and exclusion from backups. Payloads are never logged.
+///
+/// An existing file that can't be read (newer schema, damaged, oversized or
+/// unavailable) is never overwritten: saves are refused until `delete()` (an
+/// explicit discard) succeeds.
 @MainActor
 final class RecordFile<Payload: Codable> {
     private struct Envelope: Codable {
@@ -27,16 +46,36 @@ final class RecordFile<Payload: Codable> {
     let schemaVersion: Int
     let maxBytes: Int
     private let fileManager: FileManager
+    private let io: RecordIO
+    /// Why the existing file must be kept as it is; nil when it was read or is absent.
+    private(set) var blocked: StoreError?
+    /// The last save replaced the file but could not exclude it from backups.
+    private(set) var backupExclusionFailed = false
+    private var checked = false
 
-    init(directory: URL, name: String, schemaVersion: Int, maxBytes: Int, fileManager: FileManager = .default) {
+    init(directory: URL, name: String, schemaVersion: Int, maxBytes: Int, fileManager: FileManager = .default,
+         io: RecordIO = .real) {
         url = directory.appendingPathComponent(name)
         self.schemaVersion = schemaVersion
         self.maxBytes = maxBytes
         self.fileManager = fileManager
+        self.io = io
     }
 
     /// The stored payload, nil when there is none.
     func load() throws(StoreError) -> Payload? {
+        checked = true
+        do {
+            let payload = try read()
+            blocked = nil
+            return payload
+        } catch {
+            blocked = error
+            throw error
+        }
+    }
+
+    private func read() throws(StoreError) -> Payload? {
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         let data: Data
         do {
@@ -52,6 +91,8 @@ final class RecordFile<Payload: Codable> {
     }
 
     func save(_ payload: Payload) throws(StoreError) {
+        if !checked { _ = try? load() }
+        if let blocked { throw blocked }
         let data: Data
         do {
             data = try JSONEncoder().encode(Envelope(schemaVersion: schemaVersion, payload: payload))
@@ -61,24 +102,30 @@ final class RecordFile<Payload: Codable> {
         guard data.count <= maxBytes else { throw .tooLarge(bytes: data.count, limit: maxBytes) }
         do {
             try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            var target = url
-            try target.setResourceValues(values)
+            try io.write(data, url)
         } catch {
             throw .unavailable((error as NSError).domain)
+        }
+        // The new bytes are in place: a metadata failure is a warning, not a failed save.
+        do {
+            try io.excludeFromBackup(url)
+            backupExclusionFailed = false
+        } catch {
+            backupExclusionFailed = true
         }
     }
 
-    /// Removes the record. Deleting nothing is not an error.
+    /// Removes the record, including one that couldn't be read. Deleting nothing is not an error.
     func delete() throws(StoreError) {
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        do {
-            try fileManager.removeItem(at: url)
-        } catch {
-            throw .unavailable((error as NSError).domain)
+        if fileManager.fileExists(atPath: url.path) {
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                throw .unavailable((error as NSError).domain)
+            }
         }
+        blocked = nil
+        checked = true
     }
 
     var isExcludedFromBackup: Bool {

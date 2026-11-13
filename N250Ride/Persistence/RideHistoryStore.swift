@@ -30,18 +30,21 @@ final class RideHistoryStore {
 
     private(set) var rides: [RideSummary] = []
     private(set) var problem: String?
+    /// Stored history couldn't be read; it is kept untouched until discarded.
+    private(set) var isBlocked = false
     var enabled: Bool { contents.consentEpoch != nil }
 
     @ObservationIgnored private var contents = Contents()
     @ObservationIgnored private var recording: Recording?
     @ObservationIgnored private let file: RecordFile<Contents>
 
-    init(directory: URL, now: Date) {
-        file = RecordFile(directory: directory, name: "history.json", schemaVersion: 1, maxBytes: 512 * 1_024)
+    init(directory: URL, now: Date, io: RecordIO = .real) {
+        file = RecordFile(directory: directory, name: "history.json", schemaVersion: 1, maxBytes: 512 * 1_024, io: io)
         do {
             contents = try file.load() ?? Contents()
         } catch {
-            problem = "Ride history couldn't be read."
+            isBlocked = true
+            problem = "Stored ride history can't be read (it may be from a newer version). Discard it to record again."
         }
         // A draft left by a stopped app becomes an interrupted ride at its last observation.
         var changed = false
@@ -58,6 +61,7 @@ final class RideHistoryStore {
     }
 
     func setEnabled(_ on: Bool) {
+        let before = contents
         if on {
             guard contents.consentEpoch == nil else { return }
             contents.consentEpoch = UUID()
@@ -66,7 +70,21 @@ final class RideHistoryStore {
             contents.draft = nil
             recording = nil
         }
-        save()
+        if !save(), on { contents = before }
+    }
+
+    /// Explicitly throws away stored history that couldn't be read.
+    func discardStored() {
+        do {
+            try file.delete()
+            contents = Contents()
+            recording = nil
+            isBlocked = false
+            rides = []
+            problem = nil
+        } catch {
+            problem = "Couldn't remove the stored ride history."
+        }
     }
 
     /// Whether this ride ended for good (and must not be offered for recovery).
@@ -74,14 +92,35 @@ final class RideHistoryStore {
         contents.rides.contains { $0.id == id && $0.outcome.isTerminal }
     }
 
-    /// Starts recording if history is on now. A resumed ride continues from its saved
-    /// totals only under the same consent it started with.
+    /// Starts recording a new ride if history is on now.
     func begin(_ id: RideID, startedAt: Date, now: Date) {
         guard let epoch = contents.consentEpoch, !contents.deleted.contains(id) else {
             recording = nil
             return
         }
-        if let previous = contents.rides.first(where: { $0.id == id }) {
+        recording = Recording(id: id, startedAt: startedAt, epoch: epoch, accumulator: RideAccumulator(),
+                              revision: 0, lastFlush: now)
+        // Records that this ride started with history on, so a resume after a restart may continue it.
+        flushDraft(now: now)
+    }
+
+    /// The next leg of the ride being recorded: totals and revision carry on; only the
+    /// position anchor resets, so the gap at the stop is never counted.
+    func continueRide(_ id: RideID) {
+        guard recording?.id == id else { return }
+        recording?.accumulator.breakSegment()
+    }
+
+    /// A ride resumed after the app stopped. It records again only if it was being
+    /// recorded under the consent that is still in force, continuing from its saved totals.
+    func resume(_ id: RideID, now: Date) {
+        if recording?.id == id { return continueRide(id) }
+        guard let epoch = contents.consentEpoch, !contents.deleted.contains(id) else {
+            recording = nil
+            return
+        }
+        if let previous = contents.draft.flatMap({ $0.id == id ? $0 : nil })
+            ?? contents.rides.first(where: { $0.id == id }) {
             guard previous.consentEpoch == epoch, !previous.outcome.isTerminal else {
                 recording = nil
                 return
@@ -91,8 +130,8 @@ final class RideHistoryStore {
                                                                baselineMetres: previous.estimatedMetres),
                                   revision: previous.revision, lastFlush: now)
         } else {
-            recording = Recording(id: id, startedAt: startedAt, epoch: epoch, accumulator: RideAccumulator(),
-                                  revision: 0, lastFlush: now)
+            // Never saved under this consent: it wasn't being recorded, so it isn't now.
+            recording = nil
         }
     }
 
@@ -119,23 +158,38 @@ final class RideHistoryStore {
         save()
     }
 
-    func delete(_ id: RideID) {
+    /// False (and nothing changed) when the deletion couldn't be stored.
+    @discardableResult
+    func delete(_ id: RideID) -> Bool {
+        let before = contents
         contents.rides.removeAll { $0.id == id }
         if contents.draft?.id == id { contents.draft = nil }
-        if recording?.id == id { recording = nil }
         contents.deleted.append(id)
         contents.deleted = Array(contents.deleted.suffix(50))
-        save()
+        guard save() else {
+            contents = before
+            rides = contents.rides
+            return false
+        }
+        if recording?.id == id { recording = nil }
+        return true
     }
 
-    func deleteAll() {
+    @discardableResult
+    func deleteAll() -> Bool {
+        let before = contents
         contents.deleted.append(contentsOf: contents.rides.map(\.id))
         if let id = recording?.id { contents.deleted.append(id) }
         contents.deleted = Array(contents.deleted.suffix(50))
         contents.rides = []
         contents.draft = nil
+        guard save() else {
+            contents = before
+            rides = contents.rides
+            return false
+        }
         recording = nil
-        save()
+        return true
     }
 
     /// Summary fields only, for the rider to share.
@@ -181,13 +235,17 @@ final class RideHistoryStore {
         contents.rides = RideHistoryPolicy.pruned(contents.rides, now: summary.lastObservedAt)
     }
 
-    private func save() {
+    @discardableResult
+    private func save() -> Bool {
         rides = contents.rides
+        guard !isBlocked else { return false }
         do {
             try file.save(contents)
-            problem = nil
+            problem = file.backupExclusionFailed ? "Ride history may be included in phone backups." : nil
+            return true
         } catch {
-            problem = "Ride history couldn't be saved."
+            problem = "Ride history couldn't be saved. The change was not kept."
+            return false
         }
     }
 }

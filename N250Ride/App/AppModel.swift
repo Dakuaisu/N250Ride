@@ -99,11 +99,9 @@ final class AppModel {
             voice.style = voiceStyle
         }
     }
+    /// Applies to the next calculation of any kind, including reroutes of the current ride.
     var routePreferences: RoutePreferences {
-        didSet {
-            defaults.set(try? JSONEncoder().encode(routePreferences), forKey: Self.routePreferencesKey)
-            provider?.routePreferences = routePreferences
-        }
+        didSet { defaults.set(try? JSONEncoder().encode(routePreferences), forKey: Self.routePreferencesKey) }
     }
     /// Fewer Live Activity updates and no map animations. Never changes GPS quality,
     /// freshness, rerouting or dashboard deadlines.
@@ -219,7 +217,8 @@ final class AppModel {
         self.coordinator = coordinator
         self.defaults = defaults
         calls = deps.calls
-        liveActivity = RideLiveActivity(enabled: deps.liveActivities)
+        liveActivity = RideLiveActivity(enabled: deps.liveActivities, sink: deps.activitySink, timers: deps.timers,
+                                        now: { clock.wallNow })
         bike = BikeConnection(coordinator: coordinator, clock: clock, defaults: defaults)
         console = BluetoothConsole(bike: bike)
         checklist = ManualChecklist(defaults: defaults)
@@ -278,7 +277,6 @@ final class AppModel {
             updateHealth()
             scheduleWake()
         }
-        provider?.routePreferences = routePreferences
         console.host = self
         setup.host = self
         bike.onStateChange = { [weak self] _ in self?.linkChanged() }
@@ -386,7 +384,11 @@ final class AppModel {
         if let shortcut { setShortcut(shortcut, label: pending.label, coordinate: pending.coordinate) }
         places.recordRecent(label: pending.label, coordinate: pending.coordinate)
         persistPlaces()
-        if let item = pending.inboxItem { inbox.setStatus(item, .accepted) }
+        if let item = pending.inboxItem, !inbox.setStatus(item, .accepted) {
+            // Acceptance must be stored before anything is requested for a saved destination.
+            stage = .failed(pending, "Couldn't save this destination's status on the phone, so no route was requested.")
+            return
+        }
         let final = RideDestination(coordinate: pending.coordinate, label: pending.label, provenance: pending.provenance)
         guard let context = RideContext(itinerary: Itinerary(final: final, stop: pending.stop),
                                         preferences: routePreferences) else { return }
@@ -598,8 +600,12 @@ final class AppModel {
     }
 
     /// Authorises and prepares one route. Nothing active changes until commit.
-    private func requestRoute(_ reason: RouteReason, context: RideContext, pending: PendingDestination,
+    private func requestRoute(_ reason: RouteReason, context proposed: RideContext, pending: PendingDestination,
                               fix: FixRequirement? = nil) {
+        // The rider's current avoid-tolls/highways choice applies to every calculation;
+        // it becomes the ride's own only when this route is committed.
+        var context = proposed
+        context.preferences = routePreferences
         // The synthetic replay never contacts a route provider.
         guard let provider, mode == .live else { return }
         let opensPreview = reason == .initial || reason == .recovery || reason == .nextLeg
@@ -704,6 +710,11 @@ final class AppModel {
                 let expiry = timers.schedule(after: Self.previewLifetime) { [weak self] in
                     guard let self, self.proposal?.handle == route.handle else { return }
                     self.previewExpired = true
+                    if self.startStatus == .checking {
+                        // A Start still waiting for a position may no longer commit this route.
+                        self.provider?.cancelStartCheck(route.handle)
+                        self.startStatus = .blocked("This route is more than two minutes old. Recalculate before starting.")
+                    }
                 }
                 proposal = Proposal(handle: route.handle, reason: op.reason, context: op.context, session: op.session,
                                     expiry: expiry)
@@ -718,6 +729,8 @@ final class AppModel {
                     break
                 }
                 coordinator.replaceRoute()
+                ride = op.context
+                recovery.commit(op.context, startedAt: rideStartedAt ?? clock.wallNow, now: clock.wallNow)
                 history.breakSegment()
                 routeOperation = .idle
             case .replacement:
@@ -750,7 +763,8 @@ final class AppModel {
         }
         startStatus = .checking
         provider.checkStart(proposal.handle) { [weak self] check in
-            guard let self, self.proposal?.handle == proposal.handle, case .preview = self.stage else { return }
+            guard let self, self.proposal?.handle == proposal.handle, case .preview = self.stage,
+                  !self.previewExpired else { return }
             switch check {
             case .ready:
                 commitStart(proposal, pending: pending)
@@ -763,6 +777,7 @@ final class AppModel {
     }
 
     private func commitStart(_ proposal: Proposal, pending: PendingDestination) {
+        guard self.proposal?.handle == proposal.handle, !previewExpired else { return }
         let now = clock.wallNow
         recovery.recordPendingStart(proposal.context, reason: proposal.reason.rawValue, now: now)
         guard let selected = selectedRouteID,
@@ -786,7 +801,11 @@ final class AppModel {
         provider?.startGuidance()
         if !resumed || rideStartedAt == nil { rideStartedAt = now }
         recovery.commit(proposal.context, startedAt: rideStartedAt ?? now, now: now)
-        history.begin(proposal.context.id, startedAt: rideStartedAt ?? now, now: now)
+        switch proposal.reason {
+        case .nextLeg: history.continueRide(proposal.context.id)
+        case .recovery: history.resume(proposal.context.id, now: now)
+        default: history.begin(proposal.context.id, startedAt: rideStartedAt ?? now, now: now)
+        }
         if let item = pending.inboxItem { inbox.consume(item) }
         updateHealth()
         scheduleWake()
@@ -959,6 +978,10 @@ final class AppModel {
             if mode == .simulation { return restartSimulation(next) }
             var pending = Self.pending(for: next)
             pending.inboxItem = inboxItem
+            if let inboxItem, !inbox.setStatus(inboxItem, .accepted) {
+                routeOperation = .failed(.replacement, "Couldn't save the destination's status, so no route was requested.")
+                return
+            }
             requestRoute(.replacement, context: next, pending: pending)
         case .failure(.alreadyHasStop):
             routeOperation = .failed(.replacement, "This ride already has a stop. Skip it first.")
@@ -979,7 +1002,10 @@ final class AppModel {
         }
         var pending = Self.pending(for: context)
         pending.inboxItem = itemID
-        inbox.setStatus(itemID, .accepted)
+        guard inbox.setStatus(itemID, .accepted) else {
+            routeOperation = .failed(.replacement, "Couldn't save the destination's status, so no route was requested.")
+            return
+        }
         requestRoute(.replacement, context: context, pending: pending)
     }
 
@@ -993,7 +1019,15 @@ final class AppModel {
         guard !arrivalFinalized, let ride else { return }
         switch ItineraryPolicy.arrival(ride) {
         case .reachedStop(let next):
-            // End leg one completely: no session, cleared dashboard, nothing spoken for it.
+            // End leg one completely: no calculation, no session, cleared dashboard,
+            // nothing spoken for it. A reroute still running for leg one is retired
+            // here so its gate ticket can't hold up Continue.
+            if let op = operation {
+                provider?.cancelPreparation(op.id)
+                finishOperation(op)
+                record(.routeRequest(.cancelled))
+            }
+            routeOperation = .idle
             fixture?.stop()
             fixture = nil
             provider?.stop()
@@ -1124,6 +1158,7 @@ final class AppModel {
             phase: phase, position: position, navigationState: navigationState, intent: intent, route: route,
             link: link, delivery: coordinator.delivery, voice: voiceState))
         if next != health { health = next }
+        voice.setEligible(isRiding && health.directionEligible)
     }
 
     // MARK: Scheduling
@@ -1165,6 +1200,14 @@ final class AppModel {
             liveActivity.update(guidance, health: health, linkReady: bike.state.isReady, staleDate: staleDate)
         }
         scheduleWake()
+    }
+
+    /// After a suspension: run every overdue deadline now, before new output.
+    func foregroundSafetyCheck() {
+        wake?.cancel()
+        wake = nil
+        wakeAt = nil
+        wakeUp()
     }
 
     private func linkChanged() {
@@ -1216,6 +1259,16 @@ final class AppModel {
             if recentFrames.count > 20 { recentFrames.removeLast() }
         }
         return nil
+    }
+
+    /// Bench: a new clear whose own Bluetooth answer can be checked.
+    func requestFreshClear() -> Int? {
+        guard diagnosticsLockReason == nil, bike.state.isReady else { return nil }
+        return coordinator.requestFreshClear()
+    }
+
+    func clearRequestOutcome(_ id: Int) -> DashboardDelivery? {
+        coordinator.clearRequestOutcome(id)
     }
 
     @discardableResult

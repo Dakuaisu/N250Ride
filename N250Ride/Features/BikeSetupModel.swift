@@ -31,6 +31,8 @@ struct BikeCapabilityReport: Codable, Equatable {
     /// Bytes accepted by the bike's Bluetooth (not proof of display).
     var clearTransport = SetupObservation.notRun
     var samples: [String: SetupObservation] = [:]
+    /// The test arrow was seen before navigation was turned off.
+    var arrowAppeared = SetupObservation.notRun
     var stopFrameVisual = SetupObservation.notRun
     var statusVisual = SetupObservation.notRun
     var reconnect = SetupObservation.notRun
@@ -40,8 +42,38 @@ struct BikeCapabilityReport: Codable, Equatable {
         calibration == Self.calibration && self.statusProfile == statusProfile?.rawValue
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case appVersion, calibration, statusProfile, date, gatt, writeMode, maximumWrite, clearTransport, samples,
+             arrowAppeared, stopFrameVisual, statusVisual, reconnect
+    }
+
+    init(appVersion: String, calibration: String, statusProfile: String? = nil, date: Date) {
+        self.appVersion = appVersion
+        self.calibration = calibration
+        self.statusProfile = statusProfile
+        self.date = date
+    }
+
+    /// Reports saved before the arrow-appeared step read it as not checked.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        appVersion = try c.decode(String.self, forKey: .appVersion)
+        calibration = try c.decode(String.self, forKey: .calibration)
+        statusProfile = try c.decodeIfPresent(String.self, forKey: .statusProfile)
+        date = try c.decode(Date.self, forKey: .date)
+        gatt = try c.decode(SetupObservation.self, forKey: .gatt)
+        writeMode = try c.decode(String.self, forKey: .writeMode)
+        maximumWrite = try c.decode(Int.self, forKey: .maximumWrite)
+        clearTransport = try c.decode(SetupObservation.self, forKey: .clearTransport)
+        samples = try c.decode([String: SetupObservation].self, forKey: .samples)
+        arrowAppeared = try c.decodeIfPresent(SetupObservation.self, forKey: .arrowAppeared) ?? .notRun
+        stopFrameVisual = try c.decode(SetupObservation.self, forKey: .stopFrameVisual)
+        statusVisual = try c.decode(SetupObservation.self, forKey: .statusVisual)
+        reconnect = try c.decode(SetupObservation.self, forKey: .reconnect)
+    }
+
     var verdict: String {
-        let visual = Array(samples.values) + [stopFrameVisual]
+        let visual = Array(samples.values) + [arrowAppeared, stopFrameVisual]
         if gatt == .fail || visual.contains(.fail) { return "Not compatible as tested" }
         if gatt == .pass, !visual.isEmpty, visual.allSatisfy({ $0 == .pass }), samples.count == BikeSetupModel.samples.count {
             return "Works as tested (parked)"
@@ -91,6 +123,9 @@ final class BikeSetupModel {
     private(set) var step: Step = .parked
     private(set) var report: BikeCapabilityReport
     private(set) var message: String?
+    /// The wizard's own clear, judged only by its own answer.
+    private(set) var clearRequest: Int?
+    private(set) var arrowShown = false
     private(set) var saved: [String: BikeCapabilityReport] = [:]
 
     @ObservationIgnored weak var host: AppModel?
@@ -112,6 +147,8 @@ final class BikeSetupModel {
         report = BikeCapabilityReport(appVersion: appVersion, calibration: BikeCapabilityReport.calibration,
                                       statusProfile: host?.statusProfile?.rawValue, date: Date())
         message = nil
+        clearRequest = nil
+        arrowShown = false
         step = .parked
     }
 
@@ -138,13 +175,19 @@ final class BikeSetupModel {
         case .link:
             break
         case .clear:
-            guard report.clearTransport != .notRun else { return message = "Send the clear first." }
+            refreshClear()
+            guard report.clearTransport != .notRun else {
+                return message = clearRequest == nil ? "Send the clear first." : "Waiting for the bike to answer the clear."
+            }
         case .samples:
             guard Self.samples.allSatisfy({ (report.samples[$0.id] ?? .notRun) != .notRun }) else {
                 return message = "Record what the dashboard showed for every sample."
             }
         case .stopFrame:
-            guard report.stopFrameVisual != .notRun else { return message = "Record whether the arrow disappeared." }
+            guard report.arrowAppeared != .notRun else { return message = "Show the arrow and say whether you saw it." }
+            guard report.arrowAppeared != .pass || report.stopFrameVisual != .notRun else {
+                return message = "Turn navigation off and record whether the arrow disappeared."
+            }
         case .status, .reconnect:
             break
         case .report:
@@ -154,14 +197,23 @@ final class BikeSetupModel {
         if step == .report { save() }
     }
 
-    /// Clears the dashboard and records only what the Bluetooth layer can tell.
+    /// Requests a brand-new clear and records only what Bluetooth says about that one.
     func sendClear() {
         guard let host, allowed(host) else { return }
-        host.clearTestFrame()
-        switch host.dashboardDelivery {
+        report.clearTransport = .notRun
+        clearRequest = host.requestFreshClear()
+        if clearRequest == nil { message = "The clear couldn't be sent." }
+        refreshClear()
+    }
+
+    /// Reads the outcome of the wizard's own clear, once the bike has answered it.
+    func refreshClear() {
+        guard let host, let clearRequest, let outcome = host.clearRequestOutcome(clearRequest) else { return }
+        switch outcome {
         case .clearTransportAcknowledged:
             report.clearTransport = .pass
-        case .clearHandedOffWithoutResponse, .clearPending:
+            message = nil
+        case .clearHandedOffWithoutResponse:
             report.clearTransport = .inconclusive
             message = "Sent; this bike doesn't confirm writes, so delivery is unconfirmed."
         default:
@@ -178,13 +230,31 @@ final class BikeSetupModel {
         report.samples[sample.id] = observation
     }
 
-    func sendStopFrame() {
+    /// Step one of the navigation-off check: show an arrow and leave it up.
+    func showArrow() {
         guard let host, allowed(host) else { return }
         host.sendTestFrame(.turnRight, stepMetres: 300)
+        arrowShown = true
+        report.arrowAppeared = .notRun
+        report.stopFrameVisual = .notRun
+    }
+
+    func observeArrow(_ observation: SetupObservation) {
+        report.arrowAppeared = observation
+        if observation != .pass { report.stopFrameVisual = .inconclusive }
+    }
+
+    /// Step two, only after the rider saw the arrow: turn navigation off.
+    func turnNavigationOff() {
+        guard let host, allowed(host), report.arrowAppeared == .pass else {
+            message = "First confirm the arrow appeared."
+            return
+        }
         host.clearTestFrame()
     }
 
     func observeStopFrame(_ observation: SetupObservation) {
+        guard report.arrowAppeared == .pass else { return }
         report.stopFrameVisual = observation
     }
 
