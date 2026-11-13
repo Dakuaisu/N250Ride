@@ -20,12 +20,19 @@ public struct VoicePrompt: Sendable, Equatable {
     /// generation is obsolete and must not be spoken.
     public var session: SessionID
     public var generation: RouteGeneration
+    /// The maneuver a turn prompt is about (its sequence in the route).
+    public var step: Int?
+    /// A turn prompt is obsolete from this instant: its position measurement has expired.
+    public var validUntil: MonotonicInstant?
 
-    public init(text: String, priority: Priority, session: SessionID, generation: RouteGeneration) {
+    public init(text: String, priority: Priority, session: SessionID, generation: RouteGeneration,
+                step: Int? = nil, validUntil: MonotonicInstant? = nil) {
         self.text = text
         self.priority = priority
         self.session = session
         self.generation = generation
+        self.step = step
+        self.validUntil = validUntil
     }
 }
 
@@ -69,8 +76,14 @@ public struct VoicePromptPlanner: Sendable {
         let status = snapshot.state != .active
         return plan(snapshot).map {
             VoicePrompt(text: $0, priority: status ? .status : .turn, session: snapshot.session,
-                        generation: snapshot.generation)
+                        generation: snapshot.generation, step: status ? nil : snapshot.step?.sequence,
+                        validUntil: status ? nil : Self.validity(snapshot))
         }
+    }
+
+    /// Turn prompts expire with the position measurement they were planned from.
+    public static func validity(_ snapshot: NavigationSnapshot) -> MonotonicInstant {
+        (snapshot.measurementAt ?? snapshot.observedAt) + LocationAdmission.maxAge
     }
 
     /// The current instruction again, on request. Nil unless guidance is active.

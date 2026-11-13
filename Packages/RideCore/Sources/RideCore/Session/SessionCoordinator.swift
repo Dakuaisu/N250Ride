@@ -111,6 +111,8 @@ public final class SessionCoordinator {
     /// True only after the cluster acknowledged the latest clear on the current link.
     public private(set) var clearAcknowledged = false
     public private(set) var delivery: DashboardDelivery = .linkDown
+    private var clearRequests = 0
+    private var freshClear: (id: Int, outcome: DashboardDelivery?)?
 
     private var machine = NavigationStateMachine()
     private let clock: RideClock
@@ -194,6 +196,28 @@ public final class SessionCoordinator {
 
     public var isShowingDiagnosticFrame: Bool { diagnosticFrame != nil }
 
+    /// Parked bench only: submits a brand-new clear even when the dashboard is
+    /// already believed clear, so its own acknowledgement can be observed. Returns
+    /// a number identifying it; `clearRequestOutcome` reports only on that request.
+    @discardableResult
+    public func requestFreshClear() -> Int? {
+        guard machine.session == nil, let pump else { return nil }
+        diagnosticFrame = nil
+        clearRequests += 1
+        freshClear = (clearRequests, nil)
+        submitClear(on: pump)
+        sentIntent = .clear(.noSession)
+        lastNavigationSentAt = nil
+        sync()
+        return clearRequests
+    }
+
+    /// What is known about one fresh clear: nil while unanswered.
+    public func clearRequestOutcome(_ id: Int) -> DashboardDelivery? {
+        guard let freshClear, freshClear.id == id else { return .deliveryUncertain }
+        return freshClear.outcome
+    }
+
     // MARK: Link side
 
     public func linkReady(_ pump: ClusterWritePump) {
@@ -217,6 +241,10 @@ public final class SessionCoordinator {
     public func linkLost() {
         pump?.reset()
         pump = nil
+        if var fresh = freshClear, fresh.outcome == nil {
+            fresh.outcome = .linkDown
+            freshClear = fresh
+        }
         sentIntent = nil
         lastNavigationSentAt = nil
         lastStatusSentAt = nil
@@ -234,6 +262,15 @@ public final class SessionCoordinator {
             delivery = .clearHandedOffWithoutResponse
         case .failed, .timedOut, .rejectedTooLarge, .unhealthy:
             delivery = .deliveryUncertain
+        }
+        if var fresh = freshClear, fresh.outcome == nil {
+            switch event {
+            case .clearAcknowledged, .clearHandedOff, .timedOut, .rejectedTooLarge, .unhealthy:
+                fresh.outcome = delivery
+                freshClear = fresh
+            case .failed:
+                break
+            }
         }
     }
 

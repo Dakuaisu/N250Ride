@@ -86,6 +86,9 @@ public final class ClusterWritePump {
 
     public var hasWriteInFlight: Bool { inFlight != nil }
 
+    /// The channel whose acknowledged write is outstanding, if any.
+    public var inFlightChannel: ClusterChannel? { inFlight?.channel }
+
     public func submitNavigation(_ frame: [UInt8]) {
         pendingNavigation = frame
         pump()

@@ -29,7 +29,11 @@ public enum MapLinkParser {
         shortLinkHosts.contains(host.lowercased())
     }
 
+    /// Shared text longer than this is not parsed at all.
+    public static let maxInputBytes = 4 * 1_024
+
     public static func parse(_ text: String) -> MapLinkResult? {
+        guard text.utf8.count <= maxInputBytes else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         for url in urls(in: trimmed) {
