@@ -417,6 +417,222 @@ struct ReviewRegressionTests {
     }
 }
 
+
+/// Second review round: one regression per remaining finding.
+@MainActor
+struct SecondReviewRegressionTests {
+    func turn(_ metres: Int, session: SessionID, clock: ManualClock) -> NavigationSnapshot {
+        NavigationSnapshot(session: session, generation: RouteGeneration(0), observedAt: clock.now, state: .active,
+                           step: GuidanceStep(maneuver: .turnLeft, distanceMetres: metres, sequence: 1),
+                           remainingMetres: 900, remainingSeconds: 90, measurementAt: clock.now)
+    }
+
+    // 1
+    @Test func testAudioReplacesASpeakingTurn() {
+        let clock = ManualClock()
+        let speech = FakeSpeech(), audio = FakeAudio()
+        let voice = VoiceGuide(speech: speech, audio: audio, clock: clock)
+        let session = SessionID()
+        voice.handle(turn(250, session: session, clock: clock), eligible: true)
+        voice.handle(turn(50, session: session, clock: clock), eligible: true)
+        voice.test()
+        #expect(speech.stops == 1, "the speaking turn is stopped, not left playing behind the sample")
+        #expect(speech.texts.last?.hasPrefix("This is N250 Ride") == true)
+        clock.advance(by: .seconds(5))
+        voice.setEligible(false)
+        speech.finish()
+        #expect(speech.texts.count == 2, "the pending turn never plays after the sample")
+    }
+
+    // 2
+    @Test func failedResolveDoesNotExpandTheLinkAgain() async throws {
+        let storage = TestStorage.directory()
+        let h = RideHarness(storage: storage)
+        var expansions = 0
+        h.model.expandLink = { _ in
+            expansions += 1
+            let file = storage.appendingPathComponent("inbox.json")
+            try? FileManager.default.removeItem(at: file)
+            try? FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+            return URL(string: "https://maps.apple.com/?ll=12.95,77.58&q=Fuel")
+        }
+        h.model.handleIncoming("https://maps.app.goo.gl/abc")
+        for _ in 0..<50 where h.model.linkMessage == "Opening shared link…" { await Task.yield() }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(expansions == 1)
+        #expect(h.model.linkMessage == "Found the place, but couldn't save it on this phone. Try again later.")
+        #expect(h.model.stage == .choosing)
+    }
+
+    // 3
+    @Test func endingARideKeepsAnUnreadableRecoveryFile() throws {
+        let storage = TestStorage.directory()
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let future = Data(#"{"schemaVersion": 99, "payload": {}}"#.utf8)
+        let file = storage.appendingPathComponent("recovery.json")
+        try future.write(to: file)
+        let defaults = UserDefaults(suiteName: "r3-\(UUID())")!
+        defaults.set(true, forKey: "recoveryEnabled")
+        let h = RideHarness(storage: storage, defaults: defaults)
+        h.startRide()
+        h.model.stopNavigation()
+        #expect(try Data(contentsOf: file) == future, "ending the ride is not an explicit discard")
+        #expect(h.model.recovery.isBlocked)
+        h.model.discardRecovery()
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+    }
+
+    // 4
+    @Test func restartAtTheStopKeepsBothLegsInHistory() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r4-\(UUID())")!
+        func feed(_ h: RideHarness, from: Double, to: Double) {
+            for y in stride(from: from, through: to, by: 100) {
+                h.timers.advance(by: .seconds(10))
+                let place = Coordinate(latitude: 12.97 + y / 110_574, longitude: 77.59)!
+                h.spy.onFix?(AdmittedFix(sample: LocationSample(coordinate: place, horizontalAccuracy: 5,
+                                                                timestamp: h.clock.wallNow),
+                                         measuredAt: h.clock.now, expiresAt: h.clock.now + .seconds(5)))
+            }
+        }
+        let first = RideHarness(storage: storage, defaults: defaults)
+        first.model.recovery.setEnabled(true)
+        first.model.history.setEnabled(true)
+        first.startRide(stop: first.fuel)
+        feed(first, from: 0, to: 500)
+        first.emit(.arrived)
+        guard case .atStop = first.model.stage else {
+            Issue.record("expected the stop")
+            return
+        }
+
+        let second = RideHarness(storage: storage, defaults: defaults)
+        second.model.resumeRecovery()
+        guard case .atStop = second.model.stage else {
+            Issue.record("resume restores the stop")
+            return
+        }
+        #expect(second.model.history.isRecording, "recording carries on after the restart")
+        second.wait()
+        second.model.continueToFinal()
+        second.spy.pendingRoute?(.success(second.spy.options))
+        second.model.startNavigation()
+        feed(second, from: 5_000, to: 5_500)
+        second.emit(.arrived)
+        let rides = second.model.history.rides
+        #expect(rides.count == 1 && rides.first?.outcome == .completed)
+        let metres = rides.first?.estimatedMetres ?? 0
+        #expect(metres > 950 && metres < 1_050, "both legs, no gap across the stop: \(metres)")
+    }
+
+    // 5
+    @Test func finalArrivalRetiresAPendingReroute() {
+        let h = RideHarness()
+        h.startRide()
+        h.wait()
+        h.model.requestReroute(.manual)
+        h.emit(.arrived)
+        #expect(h.model.routeOperation == .idle && h.spy.cancelled.count == 1)
+        h.spy.pendingReroute?(.success(()))
+        #expect(h.spy.committed.count == 1, "the late reroute doesn't commit after arrival")
+        h.timers.advance(by: .seconds(31))
+        #expect(h.model.routeOperation == .idle, "and its deadline shows no error")
+        h.wait()
+        h.model.requestReroute(.manual)
+        #expect(h.spy.rerouteRequests.count == 1, "no recalculation after arriving")
+    }
+
+    // 6
+    func healthy() -> RideHealth {
+        RideHealthEvaluator.evaluate(RideHealthInput(
+            phase: .navigating, position: .measured(age: .seconds(1), accuracy: 5), navigationState: .active,
+            intent: .clear(.noSession), route: .ok, link: .ready, delivery: .guidanceSubmitted, voice: .ok))
+    }
+
+    func snap(_ m: Int, _ clock: ManualClock) -> NavigationSnapshot {
+        NavigationSnapshot(session: SessionID(), generation: RouteGeneration(0), observedAt: clock.now, state: .active,
+                           step: GuidanceStep(maneuver: .turnLeft, distanceMetres: m), remainingMetres: 900,
+                           remainingSeconds: 90)
+    }
+
+    @Test func energyModeRenewsFreshnessWhileTextIsHeld() async {
+        let timers = ManualRideTimers(clock: ManualClock())
+        let sink = FakeActivitySink()
+        let activity = RideLiveActivity(enabled: true, sink: sink, timers: timers, now: { timers.clock.wallNow })
+        activity.minimumInterval = 10
+        activity.start(destination: "Office")
+        let start = timers.clock.wallNow
+        for second in 0..<15 {
+            activity.update(snap(second == 0 ? 300 : 250, timers.clock), health: healthy(), linkReady: true,
+                            staleDate: timers.clock.wallNow.addingTimeInterval(5))
+            timers.advance(by: .seconds(1))
+        }
+        await activity.settle()
+        let dates = sink.staleDates.compactMap { $0 }
+        #expect(dates.count >= 5)
+        #expect(zip(dates, dates.dropFirst()).allSatisfy { $1.timeIntervalSince($0) <= 3 },
+                "renewals keep the shown content fresh while the text change is held: \(dates.map { $0.timeIntervalSince(start) })")
+        #expect(sink.calls.contains { if case .update("250 m", _) = $0 { true } else { false } },
+                "the held text still arrives")
+    }
+
+    @Test func returningToTheShownTextDropsTheHeldChange() async {
+        let timers = ManualRideTimers(clock: ManualClock())
+        let sink = FakeActivitySink()
+        let activity = RideLiveActivity(enabled: true, sink: sink, timers: timers, now: { timers.clock.wallNow })
+        activity.minimumInterval = 10
+        activity.start(destination: "Office")
+        activity.update(snap(300, timers.clock), health: healthy(), linkReady: true, staleDate: nil)
+        timers.advance(by: .seconds(1))
+        activity.update(snap(250, timers.clock), health: healthy(), linkReady: true, staleDate: nil)
+        timers.advance(by: .seconds(1))
+        activity.update(snap(300, timers.clock), health: healthy(), linkReady: true, staleDate: nil)
+        timers.advance(by: .seconds(30))
+        await activity.settle()
+        #expect(!sink.calls.contains { if case .update("250 m", _) = $0 { true } else { false } },
+                "the obsolete held change is never submitted")
+    }
+
+    @Test func slowSinkStillEndsLast() async {
+        let timers = ManualRideTimers(clock: ManualClock())
+        let sink = FakeActivitySink()
+        sink.updateDelay = .milliseconds(30)
+        let activity = RideLiveActivity(enabled: true, sink: sink, timers: timers, now: { timers.clock.wallNow })
+        activity.start(destination: "Office")
+        for m in [300, 200, 100] {
+            activity.update(snap(m, timers.clock), health: healthy(), linkReady: true,
+                            staleDate: timers.clock.wallNow.addingTimeInterval(5))
+            timers.advance(by: .seconds(3))
+        }
+        activity.end()
+        timers.advance(by: .seconds(30))
+        await activity.settle()
+        #expect(sink.calls.last == .end)
+    }
+
+    // 8
+    @Test func pumpWaitsForARawWriteOnItsChannel() {
+        let transport = RecordingTransport()
+        let pump = ClusterWritePump(transport: transport, clock: ManualClock(), link: ClusterLinkInfo(
+            navigationWriteMode: .withResponse, statusWriteMode: .withResponse, maximumWriteLength: 244))
+        var router = WriteCompletionRouter()
+        pump.isChannelHeld = { router.holds($0) }
+        guard case .success(let raw) = router.beginRaw(ClusterGATT.generalStatus, pumpBusyOn: nil) else {
+            Issue.record("refused")
+            return
+        }
+        pump.submitStatus([1, 2, 3])
+        #expect(transport.writes.isEmpty, "the app's status waits for the console's answer")
+        pump.submitNavigation(TbtFrame.start())
+        #expect(transport.writes.count == 1, "navigation isn't held up")
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(router.complete(ClusterGATT.generalStatus) == .raw(id: raw))
+        #expect(!router.isPending(raw))
+        pump.channelReleased()
+        #expect(transport.writes.last == [1, 2, 3])
+    }
+}
+
 final class RecordingTransport: ClusterWriteTransport {
     var canSendWriteWithoutResponse = true
     private(set) var writes: [[UInt8]] = []
