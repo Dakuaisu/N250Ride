@@ -14,13 +14,15 @@ sudo xcodebuild -runFirstLaunch
 `xcode-select -s` is required first: while the active developer directory is the Command Line Tools,
 `sudo xcodebuild` refuses to run.
 
-## 2. Build and test (simulation, no Google key)
+## 2. Build and test (Apple Maps, no key)
 ```sh
 scripts/bootstrap-xcode.sh
 ```
-This installs the iOS simulator platform if missing, generates `N250Ride.xcodeproj`, resolves the pinned
-Google packages (11.3.0, exact) and runs `scripts/test.sh core` and `scripts/test.sh app`. Result bundles go
-to `.omo/evidence/n250-ios-navigation/`.
+This installs the iOS simulator platform if missing, generates `N250Ride.xcodeproj` and runs
+`scripts/test.sh core` and `scripts/test.sh app`. The default build uses Apple Maps and needs no API key or
+billing; the Google packages are commented out in `project.yml` (see section 4). Simulation mode is a separate
+Diagnostics switch that replays a synthetic route without any route request. Result bundles go to
+`.omo/evidence/n250-ios-navigation/`.
 
 Individually:
 ```sh
