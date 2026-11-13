@@ -43,6 +43,9 @@ public final class ClusterWritePump {
     /// Called whenever a write completed or more writes became possible, so the
     /// owner can reschedule its next deadline.
     public var onProgress: (() -> Void)?
+    /// True while another owner (the bench console) is waiting for an answer on that
+    /// channel: the pump writes nothing there until it is released, so answers never interleave.
+    public var isChannelHeld: ((ClusterChannel) -> Bool)?
 
     private let transport: ClusterWriteTransport
     private let clock: RideClock
@@ -128,6 +131,12 @@ public final class ClusterWritePump {
         onProgress?()
     }
 
+    /// Another owner's write on a channel was answered: queued work may go now.
+    public func channelReleased() {
+        pump()
+        onProgress?()
+    }
+
     /// Times out a stuck acknowledged write; call periodically.
     public func tick() {
         guard !stalled, let current = inFlight,
@@ -188,11 +197,15 @@ public final class ClusterWritePump {
     }
 
     private func nextWrite() -> Write? {
+        let navigationHeld = isChannelHeld?(.navigation) ?? false
+        let statusHeld = isChannelHeld?(.status) ?? false
         if pendingClear {
-            return Write(channel: .navigation, bytes: TbtFrame.stop(), isClear: true)
+            if !navigationHeld { return Write(channel: .navigation, bytes: TbtFrame.stop(), isClear: true) }
+            // Nothing newer may overtake a waiting clear on navigation; status can still go.
+            return statusHeld ? nil : pendingStatus.map { Write(channel: .status, bytes: $0, isClear: false) }
         }
-        let status = pendingStatus.map { Write(channel: .status, bytes: $0, isClear: false) }
-        let navigation = pendingNavigation.map { Write(channel: .navigation, bytes: $0, isClear: false) }
+        let status = statusHeld ? nil : pendingStatus.map { Write(channel: .status, bytes: $0, isClear: false) }
+        let navigation = navigationHeld ? nil : pendingNavigation.map { Write(channel: .navigation, bytes: $0, isClear: false) }
         // Alternate when both are waiting so a steady navigation stream cannot starve status.
         if let status, navigation == nil || lastServed == .navigation { return status }
         return navigation

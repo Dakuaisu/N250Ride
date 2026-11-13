@@ -47,6 +47,15 @@ public struct WriteCompletionRouter: Sendable, Equatable {
         !(raw[characteristic.uppercased()] ?? []).isEmpty
     }
 
+    /// Whether a raw write is waiting on the characteristic the pump uses for `channel`.
+    public func holds(_ channel: ClusterChannel) -> Bool {
+        hasRawPending(on: channel == .navigation ? ClusterGATT.navigation : ClusterGATT.generalStatus)
+    }
+
+    public func isPending(_ id: Int) -> Bool {
+        raw.values.contains { $0.contains(id) }
+    }
+
     public mutating func complete(_ characteristic: String) -> Owner {
         let key = characteristic.uppercased()
         if var queue = raw[key], !queue.isEmpty {
