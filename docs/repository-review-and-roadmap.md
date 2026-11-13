@@ -730,3 +730,14 @@ Verified: 158 core and 102 app unit tests pass. No device checks.
 | 1 | A status packet already queued in the pump could still be written after a call/console pause began | Pausing (or turning status packets off) discards the unsent app status packet; one already in flight can't be recalled. |
 | 2 | With recovery off at launch, an unchecked unreadable journal could be deleted when a ride ended | With recovery off, ending a ride never touches the file; with it on, the file is read before any cleanup and kept if unreadable. |
 | 3 | An arrival reported synchronously inside `startGuidance()` was overwritten by the rest of Start | Recovery, history and inbox state are committed before guidance starts; the Apple provider handles its cached fix last. |
+
+### Fourth review round (2026-11-13)
+
+Three further issues, all confirmed and fixed; each new test failed on the previous code. Verified: 106 app unit
+tests pass (core unchanged). No device checks.
+
+| # | Issue | Fix |
+| --- | --- | --- |
+| 1 | Add as stop after final arrival reopened the completed journey | Refused after arrival with a message; End the ride and start a new one. |
+| 2 | Closing leg two's calculation or preview (e.g. Diagnostics Close route) skipped journey cleanup | A started journey is tracked independently of the screen; closing it at any point finishes history (ended by rider) and recovery. |
+| 3 | A failed history opt-out could revert after a restart | Opting out stops recording at once and is also recorded in preferences until the history file stores it; the next launch re-applies it; the failure is shown in settings. |
