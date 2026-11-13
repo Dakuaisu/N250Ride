@@ -1,4 +1,4 @@
-public enum ClusterChannel: Sendable, Equatable {
+public enum ClusterChannel: Sendable, Hashable {
     case navigation
     case status
 }
@@ -31,8 +31,18 @@ public enum ClusterWriteEvent: Sendable, Equatable {
 /// - Nothing is fragmented: a payload above the write limit is rejected.
 /// - `reset()` on link loss purges everything; a clear is never reported delivered
 ///   unless the cluster acknowledged it on the current link.
+/// - A clear that fails is sent again unless newer guidance replaced it; repeated
+///   failures end in `.unhealthy`, and the owner reconnects.
+/// - After an acknowledged write times out, which answer belongs to which write is
+///   no longer knowable: the pump stalls (sends nothing more, credits no answer)
+///   and the owner retires the link. The new link clears before anything else.
+/// - `clearAcknowledged` is reported only for the latest clear: an answer for a
+///   clear that a newer clear already superseded proves nothing.
 public final class ClusterWritePump {
     public var onEvent: ((ClusterWriteEvent) -> Void)?
+    /// Called whenever a write completed or more writes became possible, so the
+    /// owner can reschedule its next deadline.
+    public var onProgress: (() -> Void)?
 
     private let transport: ClusterWriteTransport
     private let clock: RideClock
@@ -47,6 +57,8 @@ public final class ClusterWritePump {
     private var inFlight: (channel: ClusterChannel, isClear: Bool, startedAt: MonotonicInstant)?
     private var lastServed: ClusterChannel?
     private var consecutiveFailures = 0
+    /// Set by a write timeout; the link must be replaced.
+    public private(set) var stalled = false
 
     public init(
         transport: ClusterWriteTransport,
@@ -65,6 +77,11 @@ public final class ClusterWritePump {
 
     public var isIdle: Bool {
         inFlight == nil && !pendingClear && pendingNavigation == nil && pendingStatus == nil
+    }
+
+    /// When the outstanding acknowledged write times out, if one is outstanding.
+    public var nextDeadline: MonotonicInstant? {
+        inFlight.map { $0.startedAt + writeTimeout }
     }
 
     public var hasWriteInFlight: Bool { inFlight != nil }
@@ -89,28 +106,33 @@ public final class ClusterWritePump {
 
     /// Completion of an acknowledged write on the current link.
     public func didCompleteWrite(on channel: ClusterChannel, success: Bool) {
-        guard let current = inFlight, current.channel == channel else { return }
+        guard !stalled, let current = inFlight, current.channel == channel else { return }
         inFlight = nil
         if success {
             consecutiveFailures = 0
-            if current.isClear { onEvent?(.clearAcknowledged) }
+            if current.isClear, !pendingClear { onEvent?(.clearAcknowledged) }
         } else {
+            retryIfClear(current.isClear)
             recordFailure(.failed(channel))
         }
         pump()
+        onProgress?()
     }
 
     /// CoreBluetooth signalled readiness for more without-response writes.
     public func transportReadyForWriteWithoutResponse() {
         pump()
+        onProgress?()
     }
 
     /// Times out a stuck acknowledged write; call periodically.
     public func tick() {
-        guard let current = inFlight, clock.now.duration(since: current.startedAt) >= writeTimeout else { return }
+        guard !stalled, let current = inFlight,
+              clock.now.duration(since: current.startedAt) >= writeTimeout else { return }
         inFlight = nil
+        stalled = true
+        retryIfClear(current.isClear)
         recordFailure(.timedOut(current.channel))
-        pump()
     }
 
     /// Link lost: drop all queued and in-flight work. Late completions are ignored.
@@ -121,6 +143,11 @@ public final class ClusterWritePump {
         inFlight = nil
         lastServed = nil
         consecutiveFailures = 0
+        stalled = true
+    }
+
+    private func retryIfClear(_ isClear: Bool) {
+        if isClear, pendingNavigation == nil { pendingClear = true }
     }
 
     private func recordFailure(_ event: ClusterWriteEvent) {
@@ -132,7 +159,7 @@ public final class ClusterWritePump {
     }
 
     private func pump() {
-        while inFlight == nil, let next = nextWrite() {
+        while !stalled, inFlight == nil, let next = nextWrite() {
             let mode = next.channel == .navigation ? navigationMode : (statusMode ?? .withResponse)
             if mode == .withoutResponse, !transport.canSendWriteWithoutResponse { return }
             take(next)

@@ -106,6 +106,7 @@ public final class GuidanceEngine {
     private var arrived = false
     private var lastRerouteRequest: MonotonicInstant?
     private var lastOnRoute: MonotonicInstant?
+    private var lastSnapshot: NavigationSnapshot?
 
     public init?(route: PlannedRoute, session: SessionID, generation: RouteGeneration,
                  configuration: GuidanceEngineConfiguration = GuidanceEngineConfiguration()) {
@@ -154,6 +155,22 @@ public final class GuidanceEngine {
     }
 
     public func update(_ fix: LocationFix) -> GuidanceUpdate {
+        var update = evaluate(fix)
+        update.snapshot.measurementAt = fix.observedAt
+        lastSnapshot = update.snapshot
+        return update
+    }
+
+    /// The last result, re-stamped. For a rider standing still while Core Location is
+    /// quiet: it is not a new measurement, so it never counts towards leaving the route.
+    public func refresh(at instant: MonotonicInstant) -> NavigationSnapshot? {
+        guard var snapshot = lastSnapshot else { return nil }
+        snapshot.observedAt = instant
+        lastSnapshot = snapshot
+        return snapshot
+    }
+
+    private func evaluate(_ fix: LocationFix) -> GuidanceUpdate {
         if arrived { return GuidanceUpdate(snapshot: snapshot(.arrived, at: fix.observedAt), requestReroute: false) }
         guard fix.horizontalAccuracy >= 0, fix.horizontalAccuracy <= configuration.maxAccuracyMetres else {
             return GuidanceUpdate(snapshot: snapshot(.noLocation, at: fix.observedAt), requestReroute: false)
@@ -190,11 +207,13 @@ public final class GuidanceEngine {
 
     private func guidance(at instant: MonotonicInstant) -> NavigationSnapshot {
         if rerouting { return snapshot(.rerouting, at: instant) }
-        let next = maneuvers.first { $0.along > progressMetres + 1 } ?? maneuvers[maneuvers.count - 1]
+        let index = maneuvers.firstIndex { $0.along > progressMetres + 1 } ?? maneuvers.count - 1
+        let next = maneuvers[index]
         let remaining = max(totalMetres - progressMetres, 0)
         var s = snapshot(.active, at: instant)
         s.step = GuidanceStep(maneuver: next.maneuver, roundaboutDirection: next.roundaboutDirection,
-                              distanceMetres: Int(max(next.along - progressMetres, 0).rounded()), roadText: next.road)
+                              distanceMetres: Int(max(next.along - progressMetres, 0).rounded()), roadText: next.road,
+                              sequence: index)
         s.remainingMetres = Int(remaining.rounded())
         s.remainingSeconds = totalMetres > 0 ? Int((expectedTravelSeconds * remaining / totalMetres).rounded()) : 0
         return s

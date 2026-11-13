@@ -130,14 +130,14 @@ struct SessionCoordinatorTests {
         ack(pump)
         c.receive(active(c))
         ack(pump)
-        clock.advance(by: .seconds(5))
+        clock.advance(by: .milliseconds(4_999))
         c.tick()
         ack(pump)
-        #expect(c.intent != .clear(.stale), "exactly five seconds is still fresh")
+        #expect(c.intent != .clear(.stale), "just under five seconds is still fresh")
         clock.advance(by: .milliseconds(1))
         c.tick()
         ack(pump)
-        #expect(c.intent == .clear(.stale))
+        #expect(c.intent == .clear(.stale), "a measurement exactly five seconds old is stale")
         #expect(transport.navigationWrites.last == TbtFrame.stop())
         c.receive(active(c, .turnRight))
         #expect(TbtFrameSummary(frame: transport.navigationWrites.last!)?.icon == ClusterIcon.turnRight)
@@ -225,6 +225,23 @@ struct SessionCoordinatorTests {
         let quiet = SessionCoordinator(clock: clock)
         quiet.linkReady(ClusterWritePump(transport: plain, clock: clock, link: responseLink))
         #expect(plain.writes.allSatisfy { $0.channel == .navigation })
+    }
+
+    @Test func pausedStatusSendsNothingUntilResumed() {
+        let (c, pump) = makeCoordinator(profile: .legacy55)
+        c.linkReady(pump)
+        ack(pump)
+        ack(pump, .status)
+        let before = transport.writes.count
+        c.statusPaused = true
+        for _ in 0..<4 {
+            clock.advance(by: .seconds(5))
+            c.tick()
+        }
+        #expect(transport.writes.count == before, "no status packet while paused")
+        c.statusPaused = false
+        #expect(transport.writes.count == before + 1, "resuming sends one straight away")
+        #expect(transport.writes.last?.channel == .status)
     }
 
     @Test func bluetoothLifecycleNeverRequestsRoutes() {

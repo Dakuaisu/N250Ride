@@ -1,7 +1,37 @@
 import Foundation
 
+public enum VoiceStyle: String, Sendable, Codable, CaseIterable {
+    /// Every stage, with road names (the original behaviour).
+    case detailed
+    /// No early 1 km warning and no road names: shorter, fewer interruptions.
+    case concise
+}
+
+public struct VoicePrompt: Sendable, Equatable {
+    public enum Priority: Int, Sendable, Comparable {
+        case turn, status
+        public static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+    }
+
+    public var text: String
+    /// Status changes (rerouting, GPS lost, arrival) replace pending turn prompts.
+    public var priority: Priority
+    /// Which route the prompt belongs to; a prompt for another session or
+    /// generation is obsolete and must not be spoken.
+    public var session: SessionID
+    public var generation: RouteGeneration
+
+    public init(text: String, priority: Priority, session: SessionID, generation: RouteGeneration) {
+        self.text = text
+        self.priority = priority
+        self.session = session
+        self.generation = generation
+    }
+}
+
 /// Decides when to speak and what to say, from the same snapshots that drive the
-/// dashboard. Each distance stage is spoken at most once per maneuver.
+/// dashboard. Each distance stage is spoken at most once per maneuver; a maneuver is
+/// identified by session, route generation and its position in the route.
 public struct VoicePromptPlanner: Sendable {
     public static let farMetres = 1_200
     public static let farFloorMetres = 700
@@ -9,10 +39,12 @@ public struct VoicePromptPlanner: Sendable {
     public static let nowMetres = 60
 
     private struct StepKey: Equatable {
+        var session: SessionID
         var generation: RouteGeneration
         var maneuver: Maneuver
         var direction: RoundaboutDirection?
         var road: String?
+        var sequence: Int?
     }
 
     private enum Stage: Int, Comparable {
@@ -23,10 +55,32 @@ public struct VoicePromptPlanner: Sendable {
     private var step: StepKey?
     private var spoken: Stage = .none
     private var lastState: NavigationState?
+    public var style: VoiceStyle
 
-    public init() {}
+    public init(style: VoiceStyle = .detailed) {
+        self.style = style
+    }
 
     public mutating func prompt(for snapshot: NavigationSnapshot) -> String? {
+        next(for: snapshot)?.text
+    }
+
+    public mutating func next(for snapshot: NavigationSnapshot) -> VoicePrompt? {
+        let status = snapshot.state != .active
+        return plan(snapshot).map {
+            VoicePrompt(text: $0, priority: status ? .status : .turn, session: snapshot.session,
+                        generation: snapshot.generation)
+        }
+    }
+
+    /// The current instruction again, on request. Nil unless guidance is active.
+    public func repeatPrompt(for snapshot: NavigationSnapshot) -> String? {
+        guard snapshot.state == .active, let next = snapshot.step, next.maneuver != .unsupported else { return nil }
+        if next.maneuver == .straight { return "Continue straight for \(Self.spoken(next.distanceMetres))." }
+        return "In \(Self.spoken(next.distanceMetres)), \(phrase(next))."
+    }
+
+    private mutating func plan(_ snapshot: NavigationSnapshot) -> String? {
         defer { lastState = snapshot.state }
         switch snapshot.state {
         case .rerouting:
@@ -44,14 +98,14 @@ public struct VoicePromptPlanner: Sendable {
         }
         guard let next = snapshot.step, next.maneuver != .unsupported else { return nil }
 
-        let key = StepKey(generation: snapshot.generation, maneuver: next.maneuver,
-                          direction: next.roundaboutDirection, road: next.roadText)
+        let key = StepKey(session: snapshot.session, generation: snapshot.generation, maneuver: next.maneuver,
+                          direction: next.roundaboutDirection, road: next.roadText, sequence: next.sequence)
         if key != step {
             step = key
             spoken = .none
         }
         let d = next.distanceMetres
-        let phrase = Self.phrase(next)
+        let phrase = phrase(next)
 
         if next.maneuver == .straight {
             guard spoken == .none, d >= 1_000 else { return nil }
@@ -68,7 +122,7 @@ public struct VoicePromptPlanner: Sendable {
             spoken = .mid
             return "In \(Self.spoken(d)), \(phrase)."
         }
-        if d <= Self.farMetres, d >= Self.farFloorMetres {
+        if style == .detailed, d <= Self.farMetres, d >= Self.farFloorMetres {
             guard spoken < .far else { return nil }
             spoken = .far
             return "In \(Self.spoken(d)), \(phrase)."
@@ -76,8 +130,13 @@ public struct VoicePromptPlanner: Sendable {
         return nil
     }
 
-    static func phrase(_ step: GuidanceStep) -> String {
-        let onto = step.roadText.map { " onto \($0)" } ?? ""
+    func phrase(_ step: GuidanceStep) -> String {
+        Self.phrase(step, roads: style == .detailed)
+    }
+
+    static func phrase(_ step: GuidanceStep, roads: Bool = true) -> String {
+        let road = roads ? step.roadText : nil
+        let onto = road.map { " onto \($0)" } ?? ""
         switch step.maneuver {
         case .turnLeft: return "turn left" + onto
         case .turnRight: return "turn right" + onto
@@ -95,7 +154,7 @@ public struct VoicePromptPlanner: Sendable {
         case .uTurnLeft, .uTurnRight: return "make a U-turn"
         case .roundaboutClockwise, .roundaboutCounterClockwise:
             return "at the roundabout, " + roundabout(step.roundaboutDirection)
-                + (step.roadText.map { ", towards \($0)" } ?? "")
+                + (road.map { ", towards \($0)" } ?? "")
         case .ferry: return "take the ferry"
         case .ferryTrain: return "take the train ferry"
         case .arrival: return "you will arrive at your destination"

@@ -10,6 +10,28 @@ public struct Coordinate: Sendable, Hashable, Codable {
         self.latitude = latitude
         self.longitude = longitude
     }
+
+    private enum CodingKeys: String, CodingKey { case latitude, longitude }
+
+    /// Decoding goes through the same range checks as the initializer.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let latitude = try c.decode(Double.self, forKey: .latitude)
+        let longitude = try c.decode(Double.self, forKey: .longitude)
+        guard let valid = Coordinate(latitude: latitude, longitude: longitude) else {
+            throw DecodingError.dataCorruptedError(forKey: .latitude, in: c, debugDescription: "coordinate out of range")
+        }
+        self = valid
+    }
+
+    /// Great-circle distance in metres.
+    public func distance(to other: Coordinate) -> Double {
+        let r = 6_371_000.0
+        let p1 = latitude * .pi / 180, p2 = other.latitude * .pi / 180
+        let dp = p2 - p1, dl = (other.longitude - longitude) * .pi / 180
+        let a = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2)
+        return 2 * r * atan2(a.squareRoot(), (1 - a).squareRoot())
+    }
 }
 
 public enum DestinationParseError: Error, Sendable, Equatable {

@@ -7,10 +7,11 @@ struct VoicePromptTests {
     let session = SessionID()
 
     func active(_ maneuver: Maneuver, _ metres: Int, road: String? = "MG Road", generation: Int = 0,
-                direction: RoundaboutDirection? = nil) -> NavigationSnapshot {
+                direction: RoundaboutDirection? = nil, sequence: Int? = nil) -> NavigationSnapshot {
         NavigationSnapshot(session: session, generation: RouteGeneration(generation), observedAt: MonotonicInstant(offset: .zero),
                            state: .active,
-                           step: GuidanceStep(maneuver: maneuver, roundaboutDirection: direction, distanceMetres: metres, roadText: road),
+                           step: GuidanceStep(maneuver: maneuver, roundaboutDirection: direction, distanceMetres: metres,
+                                              roadText: road, sequence: sequence),
                            remainingMetres: 5_000, remainingSeconds: 600)
     }
 
@@ -31,6 +32,33 @@ struct VoicePromptTests {
         _ = planner.prompt(for: active(.turnLeft, 40))
         #expect(planner.prompt(for: active(.turnRight, 150, road: "Queens Road")) == "In 150 metres, turn right onto Queens Road.")
         #expect(planner.prompt(for: active(.turnRight, 140, road: "Queens Road")) == nil)
+    }
+
+    @Test func identicalTurnsInARowAreBothAnnounced() {
+        var planner = VoicePromptPlanner()
+        let first = [250, 40].compactMap { planner.prompt(for: active(.turnLeft, $0, road: nil, sequence: 1)) }
+        let second = [280, 30].compactMap { planner.prompt(for: active(.turnLeft, $0, road: nil, sequence: 2)) }
+        #expect(first == ["In 250 metres, turn left.", "Now, turn left."])
+        #expect(second == ["In 300 metres, turn left.", "Now, turn left."])
+    }
+
+    @Test func engineNumbersIdenticalTurnsApart() throws {
+        let route = PlannedRoute(steps: [
+            PlannedStep(points: [at(0, 0)], instructions: ""),
+            PlannedStep(points: [at(0, 0), at(0, 300)], instructions: "Turn left"),
+            PlannedStep(points: [at(0, 300), at(-200, 300)], instructions: "Turn left"),
+            PlannedStep(points: [at(-200, 300), at(-200, 100)], instructions: "Arrive at the destination"),
+        ], expectedTravelSeconds: 200)
+        let engine = try #require(GuidanceEngine(route: route, session: session, generation: RouteGeneration(0)))
+        func step(_ x: Double, _ y: Double, _ t: Int) -> GuidanceStep? {
+            engine.update(LocationFix(coordinate: at(x, y), horizontalAccuracy: 5,
+                                      observedAt: MonotonicInstant(offset: .seconds(t)))).snapshot.step
+        }
+        let before = try #require(step(0, 100, 1))
+        let after = try #require(step(-100, 300, 2))
+        #expect(before.maneuver == .turnLeft && after.maneuver == .turnLeft)
+        #expect(before.roadText == nil && after.roadText == nil)
+        #expect(before.sequence != after.sequence)
     }
 
     @Test func rerouteGenerationIsANewStep() {

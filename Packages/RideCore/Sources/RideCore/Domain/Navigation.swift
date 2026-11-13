@@ -57,14 +57,18 @@ public struct GuidanceStep: Sendable, Equatable {
     public var distanceMetres: Int
     /// Ephemeral road/instruction text; never persisted or logged.
     public var roadText: String?
+    /// Position of this maneuver in its route, when the source knows it. Tells two
+    /// identical turns in a row apart.
+    public var sequence: Int?
 
     public init(maneuver: Maneuver, roundaboutExit: Int? = nil, roundaboutDirection: RoundaboutDirection? = nil,
-                distanceMetres: Int, roadText: String? = nil) {
+                distanceMetres: Int, roadText: String? = nil, sequence: Int? = nil) {
         self.maneuver = maneuver
         self.roundaboutExit = roundaboutExit
         self.roundaboutDirection = roundaboutDirection
         self.distanceMetres = distanceMetres
         self.roadText = roadText
+        self.sequence = sequence
     }
 }
 
@@ -73,7 +77,11 @@ public struct GuidanceStep: Sendable, Equatable {
 public struct NavigationSnapshot: Sendable, Equatable {
     public var session: SessionID
     public var generation: RouteGeneration
+    /// When this snapshot was published; orders callbacks.
     public var observedAt: MonotonicInstant
+    /// When the position behind it was measured. A refresh re-stamps `observedAt`
+    /// but never this, so freshness follows the sensor, not the publisher.
+    public var measurementAt: MonotonicInstant?
     public var state: NavigationState
     public var step: GuidanceStep?
     public var remainingMetres: Int?
@@ -88,11 +96,13 @@ public struct NavigationSnapshot: Sendable, Equatable {
         step: GuidanceStep? = nil,
         remainingMetres: Int? = nil,
         remainingSeconds: Int? = nil,
-        destinationETA: Date? = nil
+        destinationETA: Date? = nil,
+        measurementAt: MonotonicInstant? = nil
     ) {
         self.session = session
         self.generation = generation
         self.observedAt = observedAt
+        self.measurementAt = measurementAt
         self.state = state
         self.step = step
         self.remainingMetres = remainingMetres
@@ -105,13 +115,16 @@ public enum SnapshotRejection: Error, Sendable, Equatable {
     case noActiveSession
     case wrongSession
     case obsoleteGeneration
+    /// A newer route the owner has not committed yet.
+    case uncommittedGeneration
     case outOfOrder
     case sessionAlreadyStopped
 }
 
 /// Tracks the current session and decides which observations are admissible.
-/// Old sessions, older route generations and out-of-order callbacks are rejected,
-/// and `stopped` is terminal for a session.
+/// Only the exact committed generation is accepted: older routes and speculative
+/// newer ones alike are rejected until the owner commits them. Out-of-order
+/// callbacks are rejected, and `stopped` is terminal for a session.
 public struct NavigationStateMachine: Sendable {
     public private(set) var session: SessionID?
     public private(set) var generation = RouteGeneration(0)
@@ -142,7 +155,8 @@ public struct NavigationStateMachine: Sendable {
     public mutating func accept(_ snapshot: NavigationSnapshot) -> Result<NavigationSnapshot, SnapshotRejection> {
         guard let session else { return .failure(.noActiveSession) }
         guard snapshot.session == session else { return .failure(.wrongSession) }
-        guard snapshot.generation >= generation else { return .failure(.obsoleteGeneration) }
+        guard snapshot.generation <= generation else { return .failure(.uncommittedGeneration) }
+        guard snapshot.generation == generation else { return .failure(.obsoleteGeneration) }
         if let latest {
             if latest.state == .stopped, snapshot.generation == latest.generation {
                 return .failure(.sessionAlreadyStopped)
@@ -151,7 +165,6 @@ public struct NavigationStateMachine: Sendable {
                 return .failure(.outOfOrder)
             }
         }
-        generation = snapshot.generation
         latest = snapshot
         return .success(snapshot)
     }

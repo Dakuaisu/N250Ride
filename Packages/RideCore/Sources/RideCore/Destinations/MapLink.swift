@@ -14,6 +14,21 @@ public enum MapLinkResult: Sendable, Equatable {
 public enum MapLinkParser {
     static let shortLinkHosts: Set<String> = ["maps.app.goo.gl", "goo.gl", "g.co", "maps.apple"]
 
+    /// Google's own domains only, with proper label boundaries: `maps.google.co.in`
+    /// passes, `google.evil.com` and `notgoogle.com` do not.
+    public static func isGoogleHost(_ host: String) -> Bool {
+        host.lowercased().wholeMatch(of: /([a-z0-9-]+\.)*google\.(com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})/) != nil
+    }
+
+    public static func isAppleMapsHost(_ host: String) -> Bool {
+        let host = host.lowercased()
+        return host == "maps.apple.com" || host.hasSuffix(".maps.apple.com") || host == "maps.apple"
+    }
+
+    public static func isShortLinkHost(_ host: String) -> Bool {
+        shortLinkHosts.contains(host.lowercased())
+    }
+
     public static func parse(_ text: String) -> MapLinkResult? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -47,7 +62,7 @@ public enum MapLinkParser {
             item.value.map { (item.name.lowercased(), $0) }
         }, uniquingKeysWith: { first, _ in first })
 
-        if host.hasSuffix("maps.apple.com") || host == "maps.apple" {
+        if isAppleMapsHost(host) {
             let name = query["q"].flatMap { coordinateText($0) == nil ? $0 : nil }
             for key in ["ll", "daddr", "coordinate", "sll", "q"] {
                 if let value = query[key], let coordinate = coordinateText(value) {
@@ -57,7 +72,7 @@ public enum MapLinkParser {
             return nil
         }
 
-        if host.contains("google.") {
+        if isGoogleHost(host) {
             if let match = url.absoluteString.firstMatch(of: /!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/),
                let coordinate = coordinate(String(match.1), String(match.2)) {
                 return .place(coordinate, name: googlePlaceName(url))

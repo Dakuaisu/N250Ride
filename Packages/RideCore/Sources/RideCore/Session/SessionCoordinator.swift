@@ -43,6 +43,18 @@ public enum DashboardIntent: Sendable, Equatable {
     case clear(ClearReason)
 }
 
+/// What the write path can honestly say about the latest output. A transport
+/// acknowledgement proves the cluster accepted bytes, not that the rider saw them.
+public enum DashboardDelivery: Sendable, Equatable {
+    case linkDown
+    case clearPending
+    case clearTransportAcknowledged
+    case clearHandedOffWithoutResponse
+    case guidanceSubmitted
+    /// A write failed or timed out; what the cluster shows is unknown.
+    case deliveryUncertain
+}
+
 /// What is known about the physical dashboard.
 public enum DashboardOutput: Sendable, Equatable {
     /// No link: the cluster keeps whatever it last drew until its own timeout.
@@ -73,6 +85,8 @@ public struct PhoneStatus: Sendable, Equatable {
 public final class SessionCoordinator {
     public var onIntentChange: ((DashboardIntent) -> Void)?
     public var onWriteEvent: ((ClusterWriteEvent) -> Void)?
+    /// Anything that may move `nextDeadline`: a sync, a write completion, an event.
+    public var onActivity: (() -> Void)?
     public var phoneStatus = PhoneStatus()
     /// Status packet profile; nil sends none. Changeable at runtime for bench testing.
     public var statusProfile: GeneralStatusProfile? {
@@ -81,12 +95,22 @@ public final class SessionCoordinator {
             sync()
         }
     }
+    /// Holds the app's status packets, e.g. during a phone call: each one says "no
+    /// call", and the cluster drops its call screen when it reads one.
+    public var statusPaused = false {
+        didSet {
+            guard statusPaused != oldValue else { return }
+            lastStatusSentAt = nil
+            sync()
+        }
+    }
 
     public private(set) var intent: DashboardIntent = .clear(.noSession)
     public private(set) var output: DashboardOutput = .unknownLinkDown
     public private(set) var rejectedSnapshots = 0
-    /// True only after the cluster acknowledged a clear on the current link.
+    /// True only after the cluster acknowledged the latest clear on the current link.
     public private(set) var clearAcknowledged = false
+    public private(set) var delivery: DashboardDelivery = .linkDown
 
     private var machine = NavigationStateMachine()
     private let clock: RideClock
@@ -177,12 +201,13 @@ public final class SessionCoordinator {
         self.pump = pump
         clearAcknowledged = false
         pump.onEvent = { [weak self] event in
-            if event == .clearAcknowledged { self?.clearAcknowledged = true }
+            self?.record(event)
             self?.onWriteEvent?(event)
         }
+        pump.onProgress = { [weak self] in self?.onActivity?() }
         output = .sending
         // Whatever the cluster shows is from an older link: clear before anything fresh.
-        pump.submitClear()
+        submitClear(on: pump)
         sentIntent = .clear(.noSession)
         heartbeat = HeartbeatCounter()
         lastStatusSentAt = nil
@@ -196,7 +221,48 @@ public final class SessionCoordinator {
         lastNavigationSentAt = nil
         lastStatusSentAt = nil
         clearAcknowledged = false
+        delivery = .linkDown
         output = .unknownLinkDown
+    }
+
+    private func record(_ event: ClusterWriteEvent) {
+        switch event {
+        case .clearAcknowledged:
+            clearAcknowledged = true
+            delivery = .clearTransportAcknowledged
+        case .clearHandedOff:
+            delivery = .clearHandedOffWithoutResponse
+        case .failed, .timedOut, .rejectedTooLarge, .unhealthy:
+            delivery = .deliveryUncertain
+        }
+    }
+
+    private func submitClear(on pump: ClusterWritePump) {
+        clearAcknowledged = false
+        delivery = .clearPending
+        pump.submitClear()
+    }
+
+    /// The earliest moment `tick()` has work to do, or nil when nothing is due
+    /// until some external event. Used to schedule wakes instead of polling.
+    public var nextDeadline: MonotonicInstant? {
+        var deadlines: [MonotonicInstant] = []
+        if let snapshot = machine.latest, case .guidance = intent {
+            deadlines.append((snapshot.measurementAt ?? snapshot.observedAt) + configuration.freshness)
+        }
+        if let held = diagnosticFrame {
+            deadlines.append(held.startedAt + configuration.freshness)
+        }
+        if pump != nil {
+            if diagnosticFrame != nil || (sentIntent.map { if case .guidance = $0 { true } else { false } } ?? false) {
+                deadlines.append((lastNavigationSentAt ?? clock.now) + configuration.navigationResendInterval)
+            }
+            if statusProfile != nil, !statusPaused {
+                deadlines.append((lastStatusSentAt ?? clock.now) + configuration.statusInterval)
+            }
+            if let write = pump?.nextDeadline { deadlines.append(write) }
+        }
+        return deadlines.min()
     }
 
     /// Drives the watchdog, resend cadence, status heartbeat and write timeouts.
@@ -211,7 +277,7 @@ public final class SessionCoordinator {
         guard machine.session != nil else { return .clear(.noSession) }
         guard let snapshot = machine.latest else { return .clear(.notGuiding(machine.state)) }
         guard snapshot.state.allowsGuidance else { return .clear(.notGuiding(snapshot.state)) }
-        guard clock.now.duration(since: snapshot.observedAt) <= configuration.freshness else {
+        guard clock.now < (snapshot.measurementAt ?? snapshot.observedAt) + configuration.freshness else {
             return .clear(.stale)
         }
 
@@ -262,6 +328,7 @@ public final class SessionCoordinator {
     }
 
     private func sync() {
+        defer { onActivity?() }
         let next = evaluate()
         if next != intent {
             intent = next
@@ -284,7 +351,7 @@ public final class SessionCoordinator {
             sendIntent(on: pump, now: now)
         }
 
-        if let profile = statusProfile,
+        if let profile = statusProfile, !statusPaused,
            lastStatusSentAt.map({ now.duration(since: $0) >= configuration.statusInterval }) ?? true {
             let fields = GeneralStatusFields(volume: phoneStatus.volume, batteryBars: phoneStatus.batteryBars,
                                              signal: phoneStatus.signal, heartbeat: heartbeat.next())
@@ -303,12 +370,13 @@ public final class SessionCoordinator {
                 pump.submitNavigation(frame)
                 lastNavigationSentAt = now
                 sentIntent = intent
+                delivery = .guidanceSubmitted
             }
         case .clear:
             // One clear per transition; quiet valid states are not re-cleared.
             let alreadyCleared = if case .clear = sentIntent { true } else { false }
             if !alreadyCleared {
-                pump.submitClear()
+                submitClear(on: pump)
                 sentIntent = intent
                 lastNavigationSentAt = nil
             }

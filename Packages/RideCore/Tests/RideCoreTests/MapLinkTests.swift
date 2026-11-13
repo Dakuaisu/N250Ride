@@ -61,3 +61,18 @@ struct MapLinkTests {
         #expect(MapLinkParser.parse("https://maps.google.com/?q=95.0,77.0") == nil)
     }
 }
+
+@Suite("Map link hosts")
+struct MapLinkHostTests {
+    @Test func onlyGenuineMapHostsAreTrusted() {
+        for host in ["google.com", "www.google.com", "maps.google.co.in", "www.google.com.au", "google.de"] {
+            #expect(MapLinkParser.isGoogleHost(host), "\(host)")
+        }
+        for host in ["google.evil.com", "notgoogle.com", "google.com.evil.io", "evil-google.com", "google"] {
+            #expect(!MapLinkParser.isGoogleHost(host), "\(host)")
+        }
+        #expect(MapLinkParser.isAppleMapsHost("maps.apple.com") && !MapLinkParser.isAppleMapsHost("maps.apple.com.evil.io"))
+        #expect(MapLinkParser.parse("https://google.evil.com/maps/place/x/data=!3d12.9498!4d77.5866") == nil)
+        #expect(MapLinkParser.parse("https://www.google.com/maps/place/x/data=!3d12.9498!4d77.5866") != nil)
+    }
+}

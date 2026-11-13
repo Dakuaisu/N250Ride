@@ -95,7 +95,7 @@ public final class FixtureNavigationSource: NavigationSource {
         }
 
         var boundary = 0
-        for step in route.steps {
+        for (index, step) in route.steps.enumerated() {
             boundary += step.lengthMetres
             if travelled < boundary {
                 let remaining = total - travelled
@@ -103,7 +103,8 @@ public final class FixtureNavigationSource: NavigationSource {
                     .active,
                     step: GuidanceStep(maneuver: step.maneuver, roundaboutExit: step.roundaboutExit,
                                        roundaboutDirection: step.roundaboutDirection,
-                                       distanceMetres: boundary - travelled, roadText: step.roadText),
+                                       distanceMetres: boundary - travelled, roadText: step.roadText,
+                                       sequence: index),
                     remainingMetres: remaining,
                     remainingSeconds: Int(Double(remaining) / route.metresPerSecond)
                 )
@@ -124,7 +125,8 @@ public final class FixtureNavigationSource: NavigationSource {
         guard let session else { return }
         onSnapshot?(NavigationSnapshot(
             session: session, generation: generation, observedAt: clock.now, state: state,
-            step: step, remainingMetres: remainingMetres, remainingSeconds: remainingSeconds
+            step: step, remainingMetres: remainingMetres, remainingSeconds: remainingSeconds,
+            measurementAt: clock.now
         ))
     }
 }

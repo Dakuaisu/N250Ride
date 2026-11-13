@@ -95,28 +95,88 @@ struct WritePumpTests {
         #expect(events == [.rejectedTooLarge(.navigation, size: 48, maximum: 20)])
     }
 
-    @Test func failuresAndTimeoutsReportUnhealthyOnce() {
+    @Test func failuresReportUnhealthyOnce() {
+        let transport = FakeTransport()
+        let pump = ClusterWritePump(transport: transport, clock: ManualClock(), link: responseLink)
+        var events: [ClusterWriteEvent] = []
+        pump.onEvent = { events.append($0) }
+        for step in [300, 290, 280, 270] {
+            pump.submitNavigation(frame(icon: ClusterIcon.turnLeft, step: step))
+            pump.didCompleteWrite(on: .navigation, success: false)
+        }
+        #expect(events == [.failed(.navigation), .failed(.navigation), .failed(.navigation),
+                           .unhealthy(consecutiveFailures: 3), .failed(.navigation)])
+    }
+
+    @Test func timeoutStallsThePumpUntilTheLinkIsReplaced() {
         let clock = ManualClock()
         let transport = FakeTransport()
         let pump = ClusterWritePump(transport: transport, clock: clock, link: responseLink)
         var events: [ClusterWriteEvent] = []
         pump.onEvent = { events.append($0) }
-
         pump.submitNavigation(frame(icon: ClusterIcon.turnLeft, step: 300))
-        pump.didCompleteWrite(on: .navigation, success: false)
+        #expect(pump.nextDeadline == MonotonicInstant(offset: .seconds(3)))
+        clock.advance(by: .milliseconds(2_999))
+        pump.tick()
+        #expect(pump.hasWriteInFlight, "just under the 3 s timeout")
+        clock.advance(by: .milliseconds(1))
+        pump.tick()
+        #expect(events == [.timedOut(.navigation)])
+        #expect(pump.stalled && pump.nextDeadline == nil)
         pump.submitNavigation(frame(icon: ClusterIcon.turnLeft, step: 290))
-        clock.advance(by: .seconds(2))
-        pump.tick()
-        #expect(pump.hasWriteInFlight, "2 s is below the 3 s timeout")
-        clock.advance(by: .seconds(1))
-        pump.tick()
-        pump.submitNavigation(frame(icon: ClusterIcon.turnLeft, step: 280))
-        pump.didCompleteWrite(on: .navigation, success: false)
-        pump.submitNavigation(frame(icon: ClusterIcon.turnLeft, step: 270))
-        pump.didCompleteWrite(on: .navigation, success: false)
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(transport.writes.count == 1, "nothing more is sent on a link whose ordering is unknown")
+        #expect(events == [.timedOut(.navigation)], "a late answer is credited to nothing")
+    }
 
-        #expect(events == [.failed(.navigation), .timedOut(.navigation), .failed(.navigation),
-                           .unhealthy(consecutiveFailures: 3), .failed(.navigation)])
+    @Test func failedClearIsSentAgain() {
+        let transport = FakeTransport()
+        let pump = ClusterWritePump(transport: transport, clock: ManualClock(), link: responseLink)
+        var events: [ClusterWriteEvent] = []
+        pump.onEvent = { events.append($0) }
+        pump.submitClear()
+        pump.didCompleteWrite(on: .navigation, success: false)
+        #expect(transport.navigationWrites == [TbtFrame.stop(), TbtFrame.stop()])
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(events == [.failed(.navigation), .clearAcknowledged])
+        #expect(pump.isIdle)
+    }
+
+    @Test func timedOutClearIsNeverReportedAcknowledged() {
+        let clock = ManualClock()
+        let transport = FakeTransport()
+        let pump = ClusterWritePump(transport: transport, clock: clock, link: responseLink)
+        var events: [ClusterWriteEvent] = []
+        pump.onEvent = { events.append($0) }
+        pump.submitClear()
+        clock.advance(by: .seconds(3))
+        pump.tick()
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(events == [.timedOut(.navigation)], "the late answer does not acknowledge the clear")
+        #expect(transport.navigationWrites == [TbtFrame.stop()])
+    }
+
+    @Test func onlyTheLatestClearCanBeAcknowledged() {
+        let transport = FakeTransport()
+        let pump = ClusterWritePump(transport: transport, clock: ManualClock(), link: responseLink)
+        var events: [ClusterWriteEvent] = []
+        pump.onEvent = { events.append($0) }
+        pump.submitClear()
+        pump.submitClear()
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(events.isEmpty, "the first clear's answer arrived while a newer clear waits")
+        pump.didCompleteWrite(on: .navigation, success: true)
+        #expect(events == [.clearAcknowledged])
+    }
+
+    @Test func newerGuidanceReplacesAFailedClear() {
+        let transport = FakeTransport()
+        let pump = ClusterWritePump(transport: transport, clock: ManualClock(), link: responseLink)
+        pump.submitClear()
+        let fresh = frame(icon: ClusterIcon.turnLeft, step: 300)
+        pump.submitNavigation(fresh)
+        pump.didCompleteWrite(on: .navigation, success: false)
+        #expect(transport.navigationWrites == [TbtFrame.stop(), fresh])
     }
 
     @Test func resetPurgesAndIgnoresLateCompletion() {

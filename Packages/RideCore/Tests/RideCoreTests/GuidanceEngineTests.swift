@@ -139,6 +139,22 @@ struct GuidanceEngineTests {
         #expect(back.state == .active)
     }
 
+    @Test func refreshingOneMeasurementNeverCountsAsLeavingTheRoute() throws {
+        let e = engine
+        #expect(e.refresh(at: MonotonicInstant(offset: .seconds(1))) == nil, "nothing measured yet")
+        _ = e.update(fix(0, 200, t: 0))
+        let off = e.update(fix(100, 250, t: 1))
+        #expect(off.snapshot.state == .active && !off.requestReroute)
+        for t in 2...10 {
+            let refreshed = try #require(e.refresh(at: MonotonicInstant(offset: .seconds(t))))
+            #expect(refreshed.state == .active)
+            #expect(refreshed.observedAt == MonotonicInstant(offset: .seconds(t)))
+            #expect(refreshed.step == off.snapshot.step)
+        }
+        #expect(e.update(fix(100, 260, t: 11)).requestReroute == false, "only the second real off-route fix")
+        #expect(e.update(fix(100, 270, t: 12)).requestReroute)
+    }
+
     @Test func snappingIgnoresDistantPartsOfTheRoute() {
         let e = engine
         _ = e.update(fix(0, 10, t: 0))
