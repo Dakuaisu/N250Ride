@@ -1,18 +1,21 @@
-import CoreLocation
 import MapKit
 import OSLog
 import RideCore
 import UIKit
 
-/// Apple MapKit guidance: one `MKDirections` car route per explicit request or
-/// throttled reroute, followed by RideCore's `GuidanceEngine` on live locations.
-/// Apple has no motorcycle profile, so routes are car-profile and labelled as such.
-/// Routes are held in memory for the session only (Apple Maps terms, Att. 6 §2.5).
+/// Apple MapKit guidance: one car route per explicit request or throttled reroute,
+/// followed by RideCore's `GuidanceEngine` on live locations. Apple has no
+/// motorcycle profile, so routes are car-profile and labelled as such. Routes are
+/// held in memory for the session only (Apple Maps terms, Att. 6 §2.5).
+///
+/// A calculation is *prepared* without touching the active route; only
+/// `commitPreparedRoute` replaces it.
 @MainActor
 final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
     var onSnapshot: ((NavigationSnapshot) -> Void)?
     var onLongPress: ((Coordinate) -> Void)?
     var onRerouteNeeded: (() -> Void)?
+    var onFix: ((AdmittedFix) -> Void)?
     var routePreferences = RoutePreferences()
 
     let name = "Apple Maps"
@@ -24,47 +27,72 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
         that are not ideal on a bike. Never handle the phone while riding.
         """
     let sdkVersion: String? = nil
+    let supportsTransactionalReplacement = true
     var mapHostView: UIView { mapView }
     private(set) var termsAccepted: Bool
+    private(set) var lastFix: AdmittedFix?
+
+    private struct Prepared {
+        let request: NavigationRouteRequest
+        let candidates: [PlannedCandidate]
+        let origin: Coordinate
+    }
+
+    private struct Active {
+        let engine: GuidanceEngine
+        let candidate: PlannedCandidate
+    }
+
+    private struct FixWaiter {
+        let id: UUID
+        let requirement: FixRequirement
+        let completion: (LocationSample?) -> Void
+        let timeout: TimerToken
+    }
+
+    private enum LocationOwner: Hashable {
+        case acquisition(UUID), guidance, map
+    }
 
     private let mapView = MKMapView()
-    private let locationManager = CLLocationManager()
+    private let location: LocationClient
+    private let directions: DirectionsClient
     private let clock: RideClock
+    private let timers: RideTimers
     private let defaults: UserDefaults
-    private var engine: GuidanceEngine?
-    private var destination: (coordinate: Coordinate, title: String)?
-    private var candidates: [Planned] = []
-    private var selectedID = 0
-    private var routeIdentity: (session: SessionID, generation: RouteGeneration)?
+    private var admission = LocationAdmission()
+    private var lastSample: LocationSample?
+    private var active: Active?
+    private var prepared: [PreparedRouteHandle: Prepared] = [:]
+    private var previewing: (handle: PreparedRouteHandle, option: RouteOption.ID)?
+    private var pendingOperation: UUID?
+    private var waiters: [FixWaiter] = []
+    private var owners: Set<LocationOwner> = []
     private var overlays: [MKPolyline] = []
     private var guiding = false
-    private var directions: MKDirections?
-    private var lastFix: (coordinate: CLLocationCoordinate2D, accuracy: Double, at: Date)?
-    private var waitingForFix: [(CLLocationCoordinate2D?) -> Void] = []
-    private static let fixTimeout: Duration = .seconds(15)
-    /// Core Location may stay quiet while the rider is stopped. A fix this recent
-    /// still counts as a valid position, so guidance is refreshed instead of going stale.
-    private static let quietFixValidity: TimeInterval = 10
-    private var refresher: Task<Void, Never>?
+    private var followAnimations = true
+    private(set) var locationCallbacks = 0
 
+    static let fixTimeout: Duration = .seconds(15)
     private static let termsKey = "appleRouteGuidanceNoticeAccepted"
     /// Counts and error codes only; never coordinates or place names.
     nonisolated private static let log = Logger(subsystem: "com.n250ride", category: "routing")
 
-    init(clock: RideClock, defaults: UserDefaults = .standard) {
+    init(clock: RideClock, timers: RideTimers, defaults: UserDefaults = .standard,
+         location: LocationClient? = nil, directions: DirectionsClient? = nil) {
         self.clock = clock
+        self.timers = timers
         self.defaults = defaults
+        self.location = location ?? CoreLocationClient()
+        self.directions = directions ?? MapKitDirectionsClient()
         termsAccepted = defaults.bool(forKey: Self.termsKey)
         super.init()
         mapView.delegate = self
-        mapView.showsUserLocation = true
+        mapView.showsUserLocation = false
         mapView.pointOfInterestFilter = .excludingAll
         mapView.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:))))
-        locationManager.delegate = self
-        locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
-        locationManager.activityType = .automotiveNavigation
-        locationManager.distanceFilter = kCLDistanceFilterNone
-        locationManager.pausesLocationUpdatesAutomatically = false
+        self.location.onSamples = { [weak self] in self?.received($0) }
+        self.location.onAuthorizationDenied = { [weak self] in self?.permissionDenied() }
     }
 
     func requestTerms(completion: @escaping @MainActor (Bool) -> Void) {
@@ -73,220 +101,251 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
         completion(true)
     }
 
-    // MARK: Routes
+    // MARK: Prepare / commit
 
-    func requestRoute(to destination: Coordinate, title: String, session: SessionID, generation: RouteGeneration,
-                      completion: @escaping @MainActor (Result<[RouteOption], RouteRequestFailure>) -> Void) {
-        self.destination = (destination, title)
-        locationManager.startUpdatingLocation()
-        calculate(session: session, generation: generation, alternatives: true) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                showWholeRoute()
-                completion(.success(candidates.map(\.option)))
-            case .failure(let failure):
-                completion(.failure(failure))
+    func prepareRoute(_ request: NavigationRouteRequest,
+                      completion: @escaping @MainActor (Result<PreparedRoute, RouteRequestFailure>) -> Void) {
+        if let pendingOperation { cancelPreparation(pendingOperation) }
+        let operation = request.operationID
+        pendingOperation = operation
+        acquire(.acquisition(operation))
+        awaitFix(request.fix) { [weak self] sample in
+            guard let self, self.pendingOperation == operation else { return }
+            guard let sample else {
+                self.finishOperation(operation)
+                completion(.failure(.locationUnavailable))
+                return
+            }
+            let query = DirectionsQuery(origin: sample.coordinate, destination: request.target,
+                                        avoidTolls: request.preferences.avoidTolls,
+                                        avoidHighways: request.preferences.avoidHighways,
+                                        alternatives: request.alternatives)
+            Self.log.info("directions request started reason=\(request.reason.rawValue, privacy: .public)")
+            self.directions.calculate(query) { [weak self] result in
+                guard let self, self.pendingOperation == operation else { return }
+                self.finishOperation(operation)
+                switch result {
+                case .success(let candidates):
+                    let usable = candidates.filter {
+                        GuidanceEngine(route: $0.route, session: request.session, generation: request.generation) != nil
+                    }
+                    guard !usable.isEmpty else {
+                        completion(.failure(.other("empty route")))
+                        return
+                    }
+                    let handle = PreparedRouteHandle(id: UUID())
+                    self.prepared[handle] = Prepared(request: request, candidates: usable, origin: sample.coordinate)
+                    if !self.guiding, let first = usable.first {
+                        self.previewing = (handle, first.option.id)
+                        self.drawRoutes()
+                        self.showWholeRoute()
+                    }
+                    completion(.success(PreparedRoute(handle: handle, options: usable.map(\.option),
+                                                      origin: sample.coordinate)))
+                case .failure(let failure):
+                    completion(.failure(failure))
+                }
             }
         }
     }
 
-    func selectRoute(_ id: RouteOption.ID) -> Bool {
-        guard !guiding, let identity = routeIdentity, let chosen = candidates.first(where: { $0.option.id == id }),
-              let engine = GuidanceEngine(route: chosen.route, session: identity.session,
-                                          generation: identity.generation) else { return false }
-        selectedID = id
-        self.engine = engine
+    func previewPrepared(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool {
+        guard !guiding, let p = prepared[handle], p.candidates.contains(where: { $0.option.id == option }) else {
+            return false
+        }
+        previewing = (handle, option)
         drawRoutes()
         return true
     }
 
+    func checkStart(_ handle: PreparedRouteHandle, completion: @escaping @MainActor (StartCheck) -> Void) {
+        guard let p = prepared[handle] else {
+            completion(.noCurrentFix)
+            return
+        }
+        let owner = LocationOwner.acquisition(handle.id)
+        acquire(owner)
+        awaitFix(.current) { [weak self] sample in
+            self?.release(owner)
+            guard let sample else { return completion(.noCurrentFix) }
+            let moved = sample.coordinate.distance(to: p.origin)
+            completion(moved <= StartCheck.maxDisplacementMetres ? .ready : .movedFromOrigin(metres: Int(moved.rounded())))
+        }
+    }
+
+    func commitPreparedRoute(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool {
+        guard let p = prepared[handle], let candidate = p.candidates.first(where: { $0.option.id == option }),
+              let engine = GuidanceEngine(route: candidate.route, session: p.request.session,
+                                          generation: p.request.generation) else { return false }
+        active = Active(engine: engine, candidate: candidate)
+        prepared = [:]
+        previewing = nil
+        drawRoutes()
+        return true
+    }
+
+    func cancelPreparation(_ operationID: UUID) {
+        guard pendingOperation == operationID else { return }
+        directions.cancel()
+        finishOperation(operationID)
+    }
+
+    func discardPrepared(_ handle: PreparedRouteHandle) {
+        prepared[handle] = nil
+        if previewing?.handle == handle {
+            previewing = nil
+            drawRoutes()
+        }
+    }
+
+    private func finishOperation(_ operation: UUID) {
+        if pendingOperation == operation { pendingOperation = nil }
+        release(.acquisition(operation))
+    }
+
+    // MARK: Guidance
+
+    func startGuidance() {
+        guiding = true
+        drawRoutes()
+        acquire(.guidance)
+        if let lastFix, clock.now < lastFix.expiresAt { handle(lastFix) }
+        mapView.setUserTrackingMode(.followWithHeading, animated: followAnimations)
+    }
+
+    func stop() {
+        if let pendingOperation { cancelPreparation(pendingOperation) }
+        let pending = waiters
+        waiters = []
+        pending.forEach { $0.timeout.cancel() }
+        guiding = false
+        owners = owners.filter { $0 == .map }
+        updateLocationRunning()
+        if let active {
+            onSnapshot?(NavigationSnapshot(session: active.engine.session, generation: active.engine.generation,
+                                           observedAt: clock.now, state: .stopped))
+        }
+        active = nil
+        prepared = [:]
+        previewing = nil
+        drawRoutes()
+        mapView.setUserTrackingMode(.none, animated: false)
+    }
+
     func recenter() {
         if guiding || overlays.isEmpty {
-            mapView.setUserTrackingMode(guiding ? .followWithHeading : .follow, animated: true)
+            mapView.setUserTrackingMode(guiding ? .followWithHeading : .follow, animated: followAnimations)
         } else {
             showWholeRoute()
         }
     }
 
-    func reroute(session: SessionID, generation: RouteGeneration,
-                 completion: @escaping @MainActor (Result<Void, RouteRequestFailure>) -> Void) {
-        calculate(session: session, generation: generation, alternatives: false, completion: completion)
+    func setMapVisible(_ visible: Bool) {
+        mapView.showsUserLocation = visible
+        if visible { acquire(.map) } else { release(.map) }
     }
 
-    private func calculate(session: SessionID, generation: RouteGeneration, alternatives: Bool,
-                           completion: @escaping @MainActor (Result<Void, RouteRequestFailure>) -> Void) {
-        currentFix { [weak self] origin in
-            guard let self else { return }
-            guard let origin else {
-                completion(.failure(.locationUnavailable))
-                return
-            }
-            calculate(from: origin, session: session, generation: generation, alternatives: alternatives,
-                      completion: completion)
+    func setFollowAnimations(_ enabled: Bool) {
+        followAnimations = enabled
+    }
+
+    // MARK: Location
+
+    private func received(_ samples: [LocationSample]) {
+        locationCallbacks += 1
+        for sample in samples {
+            guard case .success(let fix) = admission.admit(sample, receiptWall: clock.wallNow,
+                                                           receiptMonotonic: clock.now) else { continue }
+            lastSample = sample
+            lastFix = fix
+            serveWaiters(with: sample)
+            handle(fix)
         }
     }
 
-    /// A recent, reasonably accurate fix from our own location manager, waiting up to
-    /// 15 s for one. Starting from an explicit coordinate avoids MapKit's slow
-    /// current-location lookup.
-    private func currentFix(_ completion: @escaping (CLLocationCoordinate2D?) -> Void) {
-        if let fix = lastFix, Date().timeIntervalSince(fix.at) < 30, fix.accuracy <= 100 {
-            completion(fix.coordinate)
+    private func handle(_ fix: AdmittedFix) {
+        guard guiding, let active else { return }
+        onFix?(fix)
+        let update = active.engine.update(fix.fix)
+        onSnapshot?(update.snapshot)
+        if update.requestReroute { onRerouteNeeded?() }
+    }
+
+    /// Calls back with a sample meeting `requirement`, or nil after 15 s. Each wait
+    /// has its own timeout, so an old timeout can never drain a newer wait.
+    private func awaitFix(_ requirement: FixRequirement, _ completion: @escaping (LocationSample?) -> Void) {
+        if let lastSample, requirement.accepts(lastSample, now: clock.wallNow) {
+            completion(lastSample)
             return
         }
-        locationManager.startUpdatingLocation()
-        waitingForFix.append(completion)
-        Task { [weak self] in
-            try? await Task.sleep(for: Self.fixTimeout)
-            guard let self, !waitingForFix.isEmpty else { return }
-            let waiting = waitingForFix
-            waitingForFix = []
-            waiting.forEach { $0(nil) }
+        let id = UUID()
+        let timeout = timers.schedule(after: Self.fixTimeout) { [weak self] in
+            guard let self, let index = self.waiters.firstIndex(where: { $0.id == id }) else { return }
+            let waiter = self.waiters.remove(at: index)
+            self.updateLocationRunning()
+            waiter.completion(nil)
+        }
+        waiters.append(FixWaiter(id: id, requirement: requirement, completion: completion, timeout: timeout))
+        updateLocationRunning()
+    }
+
+    private func serveWaiters(with sample: LocationSample) {
+        let now = clock.wallNow
+        let ready = waiters.filter { $0.requirement.accepts(sample, now: now) }
+        guard !ready.isEmpty else { return }
+        waiters.removeAll { waiter in ready.contains { $0.id == waiter.id } }
+        for waiter in ready {
+            waiter.timeout.cancel()
+            waiter.completion(sample)
+        }
+        updateLocationRunning()
+    }
+
+    private func acquire(_ owner: LocationOwner) {
+        owners.insert(owner)
+        updateLocationRunning()
+    }
+
+    private func release(_ owner: LocationOwner) {
+        owners.remove(owner)
+        updateLocationRunning()
+    }
+
+    /// Location runs only while something owns it: an acquisition, guidance or the visible map.
+    private func updateLocationRunning() {
+        if owners.isEmpty && waiters.isEmpty {
+            location.stop()
+        } else {
+            location.start(background: guiding)
         }
     }
 
-    private func calculate(from origin: CLLocationCoordinate2D, session: SessionID, generation: RouteGeneration,
-                           alternatives: Bool,
-                           completion: @escaping @MainActor (Result<Void, RouteRequestFailure>) -> Void) {
-        guard let destination else {
-            completion(.failure(.other("no destination")))
-            return
-        }
-        let request = MKDirections.Request()
-        request.source = MKMapItem(placemark: MKPlacemark(coordinate: origin))
-        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: CLLocationCoordinate2D(
-            latitude: destination.coordinate.latitude, longitude: destination.coordinate.longitude)))
-        request.transportType = .automobile
-        request.tollPreference = routePreferences.avoidTolls ? .avoid : .any
-        request.highwayPreference = routePreferences.avoidHighways ? .avoid : .any
-        request.requestsAlternateRoutes = alternatives
-        directions?.cancel()
-        let directions = MKDirections(request: request)
-        self.directions = directions
-        Self.log.info("directions request started alternatives=\(alternatives)")
-        directions.calculate { response, error in
-            Self.log.info("directions finished routes=\(response?.routes.count ?? 0) error=\((error as NSError?)?.domain ?? "-", privacy: .public)/\((error as NSError?)?.code ?? 0)")
-            let planned = (response?.routes ?? []).prefix(3).enumerated().map { Self.planned($0.element, id: $0.offset) }
-                .sorted { $0.option.expectedSeconds < $1.option.expectedSeconds }
-            let failure = error.map(Self.failure)
-            MainActor.assumeIsolated {
-                guard let first = planned.first else {
-                    completion(.failure(failure ?? .noRoute))
-                    return
-                }
-                guard let engine = GuidanceEngine(route: first.route, session: session, generation: generation) else {
-                    completion(.failure(.other("empty route")))
-                    return
-                }
-                // Snapshots only come from later location callbacks, so storing the new
-                // route first still lets the caller switch generation before any arrive.
-                self.engine = engine
-                self.candidates = planned
-                self.selectedID = first.option.id
-                self.routeIdentity = (session, generation)
-                self.drawRoutes()
-                completion(.success(()))
-            }
-        }
-    }
-
-    func startGuidance() {
-        guiding = true
-        drawRoutes()
-        refreshFromLastFix(maxAge: 30)
-        refresher?.cancel()
-        refresher = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                self?.refreshFromLastFix(maxAge: Self.quietFixValidity)
-            }
-        }
-        locationManager.allowsBackgroundLocationUpdates = true
-        locationManager.showsBackgroundLocationIndicator = true
-        locationManager.startUpdatingLocation()
-        mapView.setUserTrackingMode(.followWithHeading, animated: true)
-    }
-
-    func stop() {
-        guiding = false
-        refresher?.cancel()
-        refresher = nil
-        directions?.cancel()
-        directions = nil
-        locationManager.stopUpdatingLocation()
-        locationManager.allowsBackgroundLocationUpdates = false
-        if let engine {
-            onSnapshot?(NavigationSnapshot(session: engine.session, generation: engine.generation,
-                                           observedAt: clock.now, state: .stopped))
-        }
-        engine = nil
-        destination = nil
-        candidates = []
-        routeIdentity = nil
-        mapView.removeOverlays(overlays)
-        overlays = []
-        mapView.setUserTrackingMode(.none, animated: true)
-    }
-
-    // MARK: Conversion (runs on the MapKit callback; only Sendable values leave it)
-
-    private struct Planned: Sendable {
-        var route: PlannedRoute
-        var line: [Coordinate]
-        var option: RouteOption
-    }
-
-    nonisolated private static func planned(_ route: MKRoute, id: Int) -> Planned {
-        let steps = route.steps.map { step in
-            PlannedStep(points: coordinates(step.polyline), instructions: step.instructions)
-        }
-        let option = RouteOption(id: id, name: route.name, distanceMetres: route.distance,
-                                 expectedSeconds: route.expectedTravelTime,
-                                 hasTolls: route.hasTolls, hasHighways: route.hasHighways)
-        return Planned(route: PlannedRoute(steps: steps, expectedTravelSeconds: route.expectedTravelTime),
-                       line: coordinates(route.polyline), option: option)
-    }
-
-    nonisolated private static func coordinates(_ polyline: MKPolyline) -> [Coordinate] {
-        var raw = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid, count: polyline.pointCount)
-        polyline.getCoordinates(&raw, range: NSRange(location: 0, length: polyline.pointCount))
-        return raw.compactMap { Coordinate(latitude: $0.latitude, longitude: $0.longitude) }
-    }
-
-    nonisolated private static func failure(_ error: Error) -> RouteRequestFailure {
-        let nsError = error as NSError
-        if nsError.domain == "MKLocationErrorDomain" { return .locationUnavailable }
-        if nsError.domain == MKErrorDomain {
-            switch MKError.Code(rawValue: UInt(nsError.code)) {
-            case .loadingThrottled: return .throttled
-            case .directionsNotFound: return .noRoute
-            case .serverFailure: return .network
-            default: return .other("MapKit \(nsError.code)")
-            }
-        }
-        if nsError.domain == NSURLErrorDomain { return .network }
-        if nsError.domain == kCLErrorDomain { return .locationUnavailable }
-        return .other("\(nsError.domain) \(nsError.code)")
+    private func permissionDenied() {
+        guard guiding, let active else { return }
+        onSnapshot?(NavigationSnapshot(session: active.engine.session, generation: active.engine.generation,
+                                       observedAt: clock.now, state: .failed(.locationPermissionDenied)))
     }
 
     // MARK: Map
 
     /// Alternatives in grey under the selected route in blue; while guiding only the
-    /// selected route is drawn. The overlay title carries the style to the renderer.
+    /// active route is drawn. The overlay title carries the style to the renderer.
     private func drawRoutes() {
         mapView.removeOverlays(overlays)
         overlays = []
-        let shown = guiding ? candidates.filter { $0.option.id == selectedID } : candidates
-        let ordered = shown.filter { $0.option.id != selectedID } + shown.filter { $0.option.id == selectedID }
-        for candidate in ordered {
-            let coordinates = candidate.line.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+        var shown: [(candidate: PlannedCandidate, selected: Bool)] = []
+        if guiding, let active {
+            shown = [(active.candidate, true)]
+        } else if let previewing, let p = prepared[previewing.handle] {
+            shown = p.candidates.map { ($0, $0.option.id == previewing.option) }
+        }
+        for entry in shown.filter({ !$0.selected }) + shown.filter(\.selected) {
+            let coordinates = entry.candidate.line.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
             let overlay = MKPolyline(coordinates: coordinates, count: coordinates.count)
-            overlay.title = candidate.option.id == selectedID ? Self.selectedTitle : Self.alternativeTitle
+            overlay.title = entry.selected ? Self.selectedTitle : Self.alternativeTitle
             overlays.append(overlay)
         }
         mapView.addOverlays(overlays, level: .aboveRoads)
-        Self.log.info("routes drawn shown=\(self.overlays.count) guiding=\(self.guiding) mapOverlays=\(self.mapView.overlays.count)")
     }
 
     private func showWholeRoute() {
@@ -304,57 +363,6 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
         if let coordinate = Coordinate(latitude: point.latitude, longitude: point.longitude) {
             onLongPress?(coordinate)
         }
-    }
-
-    private func record(_ coordinate: CLLocationCoordinate2D, accuracy: Double) {
-        guard accuracy >= 0 else { return }
-        lastFix = (coordinate, accuracy, Date())
-        if accuracy <= 100, !waitingForFix.isEmpty {
-            let waiting = waitingForFix
-            waitingForFix = []
-            waiting.forEach { $0(coordinate) }
-        }
-    }
-
-    private func refreshFromLastFix(maxAge: TimeInterval) {
-        guard let fix = lastFix, Date().timeIntervalSince(fix.at) < maxAge,
-              let coordinate = Coordinate(latitude: fix.coordinate.latitude, longitude: fix.coordinate.longitude)
-        else { return }
-        handle(LocationFix(coordinate: coordinate, horizontalAccuracy: fix.accuracy, observedAt: clock.now))
-    }
-
-    private func handle(_ fix: LocationFix) {
-        guard guiding, let engine else { return }
-        let update = engine.update(fix)
-        onSnapshot?(update.snapshot)
-        if update.requestReroute { onRerouteNeeded?() }
-    }
-
-    private func handleAuthorization(_ status: CLAuthorizationStatus) {
-        guard guiding, let engine, status == .denied || status == .restricted else { return }
-        onSnapshot?(NavigationSnapshot(session: engine.session, generation: engine.generation,
-                                       observedAt: clock.now, state: .failed(.locationPermissionDenied)))
-    }
-}
-
-extension AppleNavigationProvider: CLLocationManagerDelegate {
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        let fixes = locations.compactMap { location -> (Coordinate, Double)? in
-            Coordinate(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude)
-                .map { ($0, location.horizontalAccuracy) }
-        }
-        MainActor.assumeIsolated {
-            for (coordinate, accuracy) in fixes {
-                record(CLLocationCoordinate2D(latitude: coordinate.latitude, longitude: coordinate.longitude),
-                       accuracy: accuracy)
-                handle(LocationFix(coordinate: coordinate, horizontalAccuracy: accuracy, observedAt: clock.now))
-            }
-        }
-    }
-
-    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        let status = manager.authorizationStatus
-        MainActor.assumeIsolated { handleAuthorization(status) }
     }
 }
 

@@ -13,18 +13,19 @@ struct N250RideWidgets: WidgetBundle {
 struct RideLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: RideActivityAttributes.self) { context in
-            LockScreenRideView(state: context.state, destination: context.attributes.destination)
+            LockScreenRideView(state: context.isStale ? .stale : context.state, destination: context.attributes.destination)
                 .activityBackgroundTint(.black.opacity(0.8))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
-            DynamicIsland {
+            let state = context.isStale ? RideActivityAttributes.ContentState.stale : context.state
+            return DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    Image(systemName: context.state.symbol)
+                    Image(systemName: state.symbol)
                         .font(.system(size: 36, weight: .bold))
-                        .foregroundStyle(context.state.warning ? .orange : .cyan)
+                        .foregroundStyle(state.warning ? .orange : .cyan)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    if let arrival = context.state.arrival {
+                    if let arrival = state.arrival {
                         VStack(alignment: .trailing, spacing: 2) {
                             Text("Arrive").font(.caption2).foregroundStyle(.secondary)
                             Text(arrival, style: .time).font(.headline)
@@ -32,18 +33,18 @@ struct RideLiveActivityWidget: Widget {
                     }
                 }
                 DynamicIslandExpandedRegion(.center) {
-                    Text(context.state.headline).font(.title2.weight(.bold)).lineLimit(1)
+                    Text(state.headline).font(.title2.weight(.bold)).lineLimit(1)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    Text(context.state.detail).font(.subheadline).lineLimit(1).foregroundStyle(.secondary)
+                    Text(state.detail).font(.subheadline).lineLimit(1).foregroundStyle(.secondary)
                 }
             } compactLeading: {
-                Image(systemName: context.state.symbol)
-                    .foregroundStyle(context.state.warning ? .orange : .cyan)
+                Image(systemName: state.symbol)
+                    .foregroundStyle(state.warning ? .orange : .cyan)
             } compactTrailing: {
-                Text(context.state.headline).font(.caption.weight(.bold)).lineLimit(1)
+                Text(state.headline).font(.caption.weight(.bold)).lineLimit(1)
             } minimal: {
-                Image(systemName: context.state.symbol)
+                Image(systemName: state.symbol)
             }
         }
     }

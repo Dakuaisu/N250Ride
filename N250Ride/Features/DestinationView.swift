@@ -231,6 +231,7 @@ struct DestinationConfirmation: View {
     @State private var label: String
     @State private var saveAsFavourite = false
     @State private var shortcut: AppModel.Shortcut?
+    @State private var stopID: UUID?
 
     init(pending: AppModel.PendingDestination) {
         self.pending = pending
@@ -266,6 +267,16 @@ struct DestinationConfirmation: View {
                     }
                     .pickerStyle(.segmented)
                     .accessibilityIdentifier("shortcutPicker")
+                    let stops = model.stopCandidates.filter { $0.coordinate != pending.coordinate }
+                    if !stops.isEmpty {
+                        Picker("Stop on the way", selection: $stopID) {
+                            Text("None").tag(UUID?.none)
+                            ForEach(stops) { place in
+                                Text(place.label).tag(UUID?.some(place.id))
+                            }
+                        }
+                        .accessibilityIdentifier("stopPicker")
+                    }
                 } footer: {
                     Text(String(format: "%.6f, %.6f", pending.coordinate.latitude, pending.coordinate.longitude))
                         .font(.caption.monospaced())
@@ -273,7 +284,8 @@ struct DestinationConfirmation: View {
 
                 Section {
                     Button {
-                        model.confirmDestination(label: label, saveAsFavourite: saveAsFavourite, shortcut: shortcut)
+                        model.confirmDestination(label: label, saveAsFavourite: saveAsFavourite, shortcut: shortcut,
+                                                 stop: model.stopCandidates.first { $0.id == stopID })
                     } label: {
                         Text(model.mode == .simulation ? "Use this destination" : "Get routes")
                             .font(.headline)

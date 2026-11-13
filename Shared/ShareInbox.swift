@@ -1,8 +1,9 @@
 import UIKit
 
-/// Hands a shared link or text from the Share extension to the app. Uses a named
-/// pasteboard, which apps from the same developer team can share without extra
-/// entitlements; the app empties it as soon as it reads it.
+/// Hands a shared link or text from the Share extension to the app through a named
+/// pasteboard. This is a short-lived hand-off, not storage: iOS may drop it (for
+/// example on restart). The app copies it into its own inbox first and only then
+/// clears it. A durable extension queue needs an App Group, which this build does not use.
 enum ShareInbox {
     private static let name = UIPasteboard.Name("com.n250ride.share-inbox")
     private static let type = "public.utf8-plain-text"
@@ -11,10 +12,13 @@ enum ShareInbox {
         UIPasteboard(name: name, create: true)?.setValue(text, forPasteboardType: type)
     }
 
-    static func take() -> String? {
+    static func peek() -> String? {
         guard let board = UIPasteboard(name: name, create: false),
               let text = board.value(forPasteboardType: type) as? String, !text.isEmpty else { return nil }
-        board.items = []
         return text
+    }
+
+    static func clear() {
+        UIPasteboard(name: name, create: false)?.items = []
     }
 }

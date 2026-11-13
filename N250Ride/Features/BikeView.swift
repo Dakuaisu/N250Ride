@@ -53,6 +53,21 @@ struct BikeView: View {
                     }
                 }
 
+                Section {
+                    NavigationLink {
+                        BikeSetupView()
+                    } label: {
+                        Label("Check this bike", systemImage: "checklist.checked")
+                    }
+                    .accessibilityIdentifier("bikeSetupLink")
+                    if let report = model.setup.savedReport(for: model.bike.rememberedBikeID) {
+                        LabeledContent("Last check", value: report.isCurrent(statusProfile: model.statusProfile)
+                                       ? report.verdict : "Out of date - check again")
+                    }
+                } footer: {
+                    Text("A parked, step-by-step check that the dashboard shows what the app sends.")
+                }
+
                 if model.bike.rememberedBikeID != nil {
                     Section {
                         Button("Disconnect") { model.bike.disconnect() }

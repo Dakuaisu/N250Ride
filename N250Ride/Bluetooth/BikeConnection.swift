@@ -36,7 +36,10 @@ enum ConsoleLinkEvent {
 @MainActor
 @Observable
 final class BikeConnection: NSObject {
-    private(set) var state: BikeLinkState = .idle
+    private(set) var state: BikeLinkState = .idle {
+        didSet { if state != oldValue { onStateChange?(state) } }
+    }
+    @ObservationIgnored var onStateChange: ((BikeLinkState) -> Void)?
     private(set) var discovered: [DiscoveredBike] = []
     private(set) var rememberedBikeID: UUID?
     /// Filled by `exploreGatt()` for the Bluetooth console.
@@ -57,11 +60,14 @@ final class BikeConnection: NSObject {
     @ObservationIgnored private var attempt = 0
     @ObservationIgnored private var scanTimeout: Task<Void, Never>?
     @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var discoveryTimeout: Task<Void, Never>?
+    @ObservationIgnored private var lifecycle = BikeLinkLifecycle()
 
     static let restoreIdentifier = "com.n250ride.cluster-central"
     private static let rememberedKey = "rememberedBikeID"
     private static let scanDuration: Duration = .seconds(10)
     private static let connectTimeout: Duration = .seconds(15)
+    private static let discoveryLimit: Duration = .seconds(15)
 
     private let serviceUUID = CBUUID(string: ClusterGATT.service)
     private let navigationUUID = CBUUID(string: ClusterGATT.navigation)
@@ -81,7 +87,14 @@ final class BikeConnection: NSObject {
         #endif
         central = CBCentralManager(delegate: self, queue: .main, options: options)
         coordinator.onWriteEvent = { [weak self] event in
-            if case .unhealthy = event { self?.dropLinkForReconnect() }
+            switch event {
+            case .unhealthy, .timedOut:
+                // A timed-out acknowledged write leaves the link's ordering unknown:
+                // retire it and start clean (the new link clears before anything else).
+                self?.dropLinkForReconnect()
+            default:
+                break
+            }
         }
     }
 
@@ -132,6 +145,8 @@ final class BikeConnection: NSObject {
         state = .idle
     }
 
+    var linkEpoch: Int { lifecycle.epoch }
+
     /// Clears the remembered bike; the rider must scan and pick again.
     func forgetBike() {
         disconnect()
@@ -143,10 +158,17 @@ final class BikeConnection: NSObject {
 
     // MARK: Bluetooth console (parked bike only; the console enforces when)
 
-    /// Firmware-update service (Texas Instruments OAD) seen on Pulsar clusters:
-    /// never written to, because a bad write could brick the dashboard.
+    /// Texas Instruments firmware-update families seen on Pulsar clusters: OAD image
+    /// transfer and control (F000FFC_) and OAD reset (F000FFD_). Never written to,
+    /// because a bad write could brick the dashboard.
     static func isBlocked(_ characteristic: String) -> Bool {
-        characteristic.uppercased().hasPrefix("F000FFD")
+        let id = characteristic.uppercased()
+        return id.hasPrefix("F000FFC") || id.hasPrefix("F000FFD")
+    }
+
+    /// Also refuses any characteristic inside a firmware-update service, whatever its own UUID.
+    static func isBlocked(_ characteristic: String, service: String) -> Bool {
+        isBlocked(characteristic) || isBlocked(service)
     }
 
     func exploreGatt() {
@@ -162,10 +184,13 @@ final class BikeConnection: NSObject {
         guard state.isReady, let peripheral else { return "Bike not connected." }
         guard !Self.isBlocked(uuid) else { return "Blocked: firmware-update service." }
         guard uuid.uppercased() != ClusterGATT.navigation else { return "Use the navigation frame sender for this channel." }
-        if uuid.uppercased() == ClusterGATT.generalStatus, coordinator.statusProfile != nil {
+        if uuid.uppercased() == ClusterGATT.generalStatus, coordinator.statusProfile != nil, !coordinator.statusPaused {
             return "Set Status packet to Off in Diagnostics first, so the app's own packets don't interfere."
         }
         guard let characteristic = characteristic(uuid) else { return "Channel not found. Explore services first." }
+        if let service = characteristic.service, Self.isBlocked(uuid, service: service.uuid.uuidString) {
+            return "Blocked: firmware-update service."
+        }
         let type: CBCharacteristicWriteType = withResponse ? .withResponse : .withoutResponse
         let canWrite = withResponse ? characteristic.properties.contains(.write)
                                     : characteristic.properties.contains(.writeWithoutResponse)
@@ -206,6 +231,13 @@ final class BikeConnection: NSObject {
     }
 
     private func connect(_ target: CBPeripheral) {
+        let (epoch, replaced) = lifecycle.begin(target.identifier)
+        if let replaced, let old = peripheral, old.identifier == replaced {
+            // Switching bikes: the old link is cancelled and torn down before the new one starts.
+            old.delegate = nil
+            central.cancelPeripheralConnection(old)
+            tearDownLink(retire: false)
+        }
         peripheral = target
         target.delegate = self
         state = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
@@ -213,9 +245,21 @@ final class BikeConnection: NSObject {
         retryTask?.cancel()
         retryTask = Task { [weak self] in
             try? await Task.sleep(for: Self.connectTimeout)
-            guard !Task.isCancelled, let self, let peripheral = self.peripheral,
-                  peripheral.state != .connected else { return }
-            self.central.cancelPeripheralConnection(peripheral)
+            guard !Task.isCancelled, let self, self.lifecycle.owns(target.identifier, epoch: epoch),
+                  target.state != .connected else { return }
+            self.central.cancelPeripheralConnection(target)
+            self.scheduleRetry(after: .connectTimeout)
+        }
+    }
+
+    private func startDiscoveryTimeout(for target: CBPeripheral) {
+        let epoch = lifecycle.epoch
+        discoveryTimeout?.cancel()
+        discoveryTimeout = Task { [weak self] in
+            try? await Task.sleep(for: Self.discoveryLimit)
+            guard !Task.isCancelled, let self, self.lifecycle.owns(target.identifier, epoch: epoch),
+                  self.state == .discovering else { return }
+            self.central.cancelPeripheralConnection(target)
             self.scheduleRetry(after: .connectTimeout)
         }
     }
@@ -234,9 +278,11 @@ final class BikeConnection: NSObject {
         }
         state = .reconnecting(attempt: attempt)
         retryTask?.cancel()
+        let epoch = lifecycle.epoch
         retryTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
-            guard !Task.isCancelled, let self, self.wantConnection else { return }
+            guard !Task.isCancelled, let self, self.wantConnection,
+                  self.lifecycle.owns(target.identifier, epoch: epoch) else { return }
             self.connect(target)
         }
     }
@@ -246,7 +292,9 @@ final class BikeConnection: NSObject {
         central.cancelPeripheralConnection(peripheral)
     }
 
-    private func tearDownLink() {
+    private func tearDownLink(retire: Bool = true) {
+        discoveryTimeout?.cancel()
+        if retire { lifecycle.retire() }
         exploring = false
         pendingRawWrites = []
         gattServices = []
@@ -256,8 +304,9 @@ final class BikeConnection: NSObject {
     }
 
     private func linkValidated(_ info: ClusterLinkInfo, navigation: CBCharacteristic, status: CBCharacteristic?) {
-        guard let peripheral else { return }
+        guard let peripheral, lifecycle.validated(peripheral.identifier, epoch: lifecycle.epoch) else { return }
         retryTask?.cancel()
+        discoveryTimeout?.cancel()
         attempt = 0
         let transport = CoreBluetoothClusterTransport(peripheral: peripheral, navigation: navigation, status: status)
         let pump = ClusterWritePump(transport: transport, clock: clock, link: info)
@@ -323,14 +372,19 @@ extension BikeConnection: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         let id = peripheral.identifier
         MainActor.assumeIsolated {
-            guard let current = self.peripheral, current.identifier == id else { return }
+            guard let current = self.peripheral, current.identifier == id, lifecycle.isCurrent(id) else { return }
             state = .discovering
+            startDiscoveryTimeout(for: current)
             current.discoverServices([serviceUUID])
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        MainActor.assumeIsolated { scheduleRetry(after: .connectTimeout) }
+        let id = peripheral.identifier
+        MainActor.assumeIsolated {
+            guard self.peripheral?.identifier == id, lifecycle.isCurrent(id) else { return }
+            scheduleRetry(after: .connectTimeout)
+        }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,

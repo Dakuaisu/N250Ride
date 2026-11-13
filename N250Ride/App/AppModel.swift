@@ -7,6 +7,10 @@ import RideCore
 
 /// Composition root and persistent session owner. Lives for the whole process so
 /// view recreation can never restart navigation or re-request a route.
+///
+/// Route changes follow one transaction: authorise one gate ticket, *prepare* a
+/// route without touching the active one, then *commit* it on the main actor before
+/// any of its snapshots can arrive. Preparation failures change nothing that is active.
 @MainActor
 @Observable
 final class AppModel {
@@ -20,6 +24,11 @@ final class AppModel {
     struct PendingDestination: Equatable {
         var coordinate: Coordinate
         var label: String
+        var provenance: DestinationProvenance = .manual
+        /// The one optional stop on the way, chosen at confirmation.
+        var stop: RideDestination?
+        /// The inbox item this destination came from, consumed once its ride starts.
+        var inboxItem: UUID?
     }
 
     enum Tab: Hashable {
@@ -32,7 +41,22 @@ final class AppModel {
         case requesting(PendingDestination)
         case preview(PendingDestination)
         case navigating(PendingDestination)
+        /// Leg one ended at the stop; nothing is guided until the rider continues.
+        case atStop(PendingDestination)
         case failed(PendingDestination, String)
+    }
+
+    /// A rider-visible route calculation during a ride (reroute or replacement).
+    enum RouteOperationStatus: Equatable {
+        case idle
+        case preparing(RouteReason)
+        case failed(RouteReason, String)
+    }
+
+    enum StartStatus: Equatable {
+        case idle
+        case checking
+        case blocked(String)
     }
 
     /// Persisted switch for the synthetic replay (and UI tests via `-simulationMode YES`).
@@ -51,17 +75,42 @@ final class AppModel {
     private(set) var selectedRouteID: RouteOption.ID?
     /// Latest accepted guidance, for the on-phone turn card.
     private(set) var guidance: NavigationSnapshot?
+    /// The journey being ridden: itinerary, leg and preferences.
+    private(set) var ride: RideContext?
+    private(set) var routeOperation: RouteOperationStatus = .idle
+    private(set) var startStatus: StartStatus = .idle
+    private(set) var previewExpired = false
+    private(set) var health = RideHealthEvaluator.evaluate(AppModel.idleHealthInput)
+    private(set) var recoveryOffer: RecoveryOffer?
     let search = PlaceSearch()
     private(set) var places: SavedPlaces
     /// Shown when a shared or pasted link has no usable location.
     var linkMessage: String?
     var voiceEnabled: Bool {
-        didSet { defaults.set(voiceEnabled, forKey: Self.voiceKey) }
+        didSet {
+            defaults.set(voiceEnabled, forKey: Self.voiceKey)
+            voice.setEnabled(voiceEnabled)
+            updateHealth()
+        }
+    }
+    var voiceStyle: VoiceStyle {
+        didSet {
+            defaults.set(voiceStyle.rawValue, forKey: Self.voiceStyleKey)
+            voice.style = voiceStyle
+        }
     }
     var routePreferences: RoutePreferences {
         didSet {
             defaults.set(try? JSONEncoder().encode(routePreferences), forKey: Self.routePreferencesKey)
             provider?.routePreferences = routePreferences
+        }
+    }
+    /// Fewer Live Activity updates and no map animations. Never changes GPS quality,
+    /// freshness, rerouting or dashboard deadlines.
+    var energySaving: Bool {
+        didSet {
+            defaults.set(energySaving, forKey: Self.energyKey)
+            applyEnergyMode()
         }
     }
 
@@ -78,48 +127,114 @@ final class AppModel {
 
     let bike: BikeConnection
     let console: BluetoothConsole
+    let checklist: ManualChecklist
     let routeGate: RouteRequestGate
     let provider: LiveNavigationProvider?
+    let voice: VoiceGuide
+    let recovery: RecoveryStore
+    let inbox: IncomingInbox
+    let history: RideHistoryStore
+    let setup: BikeSetupModel
 
     @ObservationIgnored private let clock: RideClock
+    @ObservationIgnored private let timers: RideTimers
     @ObservationIgnored private let coordinator: SessionCoordinator
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let locationManager = CLLocationManager()
     /// Injectable for tests; reads the app's Core Location authorisation.
     @ObservationIgnored var locationAuthorization: () -> CLAuthorizationStatus = { CLLocationManager().authorizationStatus }
     @ObservationIgnored private var fixture: FixtureNavigationSource?
-    @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private var lastLinkSummary: DiagnosticsLog.LinkSummary?
-    @ObservationIgnored private let voice = VoiceGuide()
-    @ObservationIgnored private let liveActivity = RideLiveActivity()
+    @ObservationIgnored private let liveActivity: RideLiveActivity
+    @ObservationIgnored private let calls: CallStateSource
+    @ObservationIgnored private var callInProgress = false
+    @ObservationIgnored private var consoleHoldsStatus = false
+    @ObservationIgnored private var wake: TimerToken?
+    @ObservationIgnored private var wakeAt: MonotonicInstant?
+    @ObservationIgnored private var rideStartedAt: Date?
+    @ObservationIgnored private var arrivalFinalized = false
+
+    /// The one calculation in flight. Its gate ticket is released exactly once,
+    /// whichever comes first: the answer, the 30-second deadline, Cancel or Stop.
+    private struct Operation {
+        let id: UUID
+        let ticket: RouteTicket
+        let reason: RouteReason
+        let context: RideContext
+        let session: SessionID
+        let generation: RouteGeneration
+        let pending: PendingDestination
+        let deadline: TimerToken
+    }
+
+    /// A calculated route awaiting Start (initial, recovery or next leg). No authority until committed.
+    private struct Proposal {
+        let handle: PreparedRouteHandle
+        let reason: RouteReason
+        let context: RideContext
+        let session: SessionID
+        let expiry: TimerToken
+    }
+
+    @ObservationIgnored private var operation: Operation?
+    @ObservationIgnored private var proposal: Proposal?
+
+    /// Counted for the energy measurements in Diagnostics.
+    private(set) var counters = EnergyCounters()
+
+    struct EnergyCounters: Equatable {
+        var wakes = 0
+        var snapshots = 0
+        var startedAt = Date()
+    }
 
     struct SentFrame: Identifiable {
         let id = UUID()
         let summary: TbtFrameSummary
     }
 
+    static let operationDeadline: Duration = .seconds(30)
+    static let previewLifetime: Duration = .seconds(120)
+    /// Smallest gap between wakes, so an overdue deadline can never spin.
+    static let minimumWake: Duration = .milliseconds(20)
+    static let fixtureTick: Duration = .milliseconds(200)
+
     private static let favouritesKey = "favourites"
     private static let statusProfileKey = "statusProfile"
     private static let simulationKey = "simulationMode"
     private static let placesKey = "savedPlaces"
     private static let voiceKey = "voiceGuidance"
+    private static let voiceStyleKey = "voiceStyle"
     private static let routePreferencesKey = "routePreferences"
+    private static let energyKey = "energySaving"
 
     init(configuration: AppConfiguration = .load(), defaults: UserDefaults = .standard,
-         provider injected: LiveNavigationProvider? = nil) {
-        let clock = SystemRideClock()
+         provider injected: LiveNavigationProvider? = nil, dependencies: AppDependencies? = nil) {
+        let deps = dependencies ?? .live()
+        let clock = deps.clock
         let coordinator = SessionCoordinator(clock: clock, configuration: SessionConfiguration(
             statusProfile: configuration.provenStatusProfile))
         self.clock = clock
+        timers = deps.timers
         self.coordinator = coordinator
         self.defaults = defaults
-        bike = BikeConnection(coordinator: coordinator, clock: clock)
+        calls = deps.calls
+        liveActivity = RideLiveActivity(enabled: deps.liveActivities)
+        bike = BikeConnection(coordinator: coordinator, clock: clock, defaults: defaults)
         console = BluetoothConsole(bike: bike)
+        checklist = ManualChecklist(defaults: defaults)
         routeGate = RouteRequestGate(
             policy: configuration.liveRoutePolicy,
             store: UserDefaultsUsageCounterStore(defaults: defaults),
             clock: clock
         )
+        let now = clock.wallNow
+        recovery = RecoveryStore(directory: deps.storage, defaults: defaults)
+        inbox = IncomingInbox(directory: deps.storage, now: now)
+        history = RideHistoryStore(directory: deps.storage, now: now)
+        let info = Bundle.main.infoDictionary ?? [:]
+        setup = BikeSetupModel(directory: deps.storage,
+                               appVersion: "\(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?"))")
         favourites = defaults.data(forKey: Self.favouritesKey)
             .flatMap { try? JSONDecoder().decode(FavouritesList.self, from: $0) } ?? FavouritesList()
         let profile = defaults.string(forKey: Self.statusProfileKey).flatMap(GeneralStatusProfile.init(rawValue:))
@@ -129,11 +244,15 @@ final class AppModel {
         places = defaults.data(forKey: Self.placesKey)
             .flatMap { try? JSONDecoder().decode(SavedPlaces.self, from: $0) } ?? SavedPlaces()
         voiceEnabled = defaults.object(forKey: Self.voiceKey) as? Bool ?? true
+        let style = defaults.string(forKey: Self.voiceStyleKey).flatMap(VoiceStyle.init(rawValue:)) ?? .detailed
+        voiceStyle = style
+        voice = VoiceGuide(speech: deps.speech, audio: deps.audio, clock: clock, style: style)
         routePreferences = defaults.data(forKey: Self.routePreferencesKey)
             .flatMap { try? JSONDecoder().decode(RoutePreferences.self, from: $0) } ?? RoutePreferences()
+        energySaving = defaults.bool(forKey: Self.energyKey)
         UIDevice.current.isBatteryMonitoringEnabled = true
 
-        provider = injected ?? Self.makeProvider(configuration, clock: clock)
+        provider = injected ?? Self.makeProvider(configuration, clock: clock, timers: deps.timers)
         simulationMode = provider == nil || defaults.bool(forKey: Self.simulationKey)
         termsAccepted = provider?.termsAccepted ?? true
 
@@ -146,23 +265,40 @@ final class AppModel {
                 if recentFrames.count > 20 { recentFrames.removeLast() }
             }
         }
+        coordinator.onActivity = { [weak self] in self?.scheduleWake() }
         provider?.onSnapshot = { [weak self] in self?.receive($0) }
         provider?.onLongPress = { [weak self] coordinate in
             guard let self, stage == .choosing else { return }
-            propose(coordinate)
+            propose(coordinate, provenance: .mapSelection)
         }
-        provider?.onRerouteNeeded = { [weak self] in self?.reroute() }
+        provider?.onRerouteNeeded = { [weak self] in self?.requestReroute(.offRoute) }
+        provider?.onFix = { [weak self] fix in
+            guard let self else { return }
+            history.add(fix.fix, now: clock.wallNow)
+            updateHealth()
+            scheduleWake()
+        }
         provider?.routePreferences = routePreferences
         console.host = self
+        setup.host = self
+        bike.onStateChange = { [weak self] _ in self?.linkChanged() }
+        calls.onChange = { [weak self] active in self?.callChanged(active) }
+        voice.setEnabled(voiceEnabled)
+        callChanged(calls.callInProgress)
+        applyEnergyMode()
+        liveActivity.endOrphans()
+        recoveryOffer = recovery.offer(now: now).flatMap { history.isFinished($0.rideID) ? nil : $0 }
         record(.appLaunched(live: mode == .live))
         if provider?.termsAccepted == true { acceptTerms() }
-        startTicker()
+        updateHealth()
+        scheduleWake()
     }
 
-    private static func makeProvider(_ configuration: AppConfiguration, clock: RideClock) -> LiveNavigationProvider? {
+    private static func makeProvider(_ configuration: AppConfiguration, clock: RideClock,
+                                     timers: RideTimers) -> LiveNavigationProvider? {
         switch configuration.navigationProvider {
         case .apple:
-            return AppleNavigationProvider(clock: clock)
+            return AppleNavigationProvider(clock: clock, timers: timers)
         case .google:
             #if canImport(GoogleNavigation)
             if case .metered = configuration.liveRoutePolicy, let key = configuration.googleAPIKey,
@@ -189,12 +325,15 @@ final class AppModel {
         case .requesting: return "A route is being calculated on the Ride tab."
         case .preview: return "A route is open on the Ride tab (Choose a route)."
         case .navigating: return "A ride is in progress on the Ride tab."
+        case .atStop: return "A ride is paused at its stop on the Ride tab."
         case .choosing, .confirming, .failed:
             return navigationState == .active || navigationState == .rerouting ? "Navigation is still active." : nil
         }
     }
 
     var diagnosticsLocked: Bool { diagnosticsLockReason != nil }
+
+    var dashboardDelivery: DashboardDelivery { coordinator.delivery }
 
     /// Closes an open route or ends the ride so the bench tools can be used.
     func endRideForDiagnostics() {
@@ -205,9 +344,11 @@ final class AppModel {
 
     /// Long-press, favourite and pasted destinations all enter here and share the
     /// same confirmation and request gate.
-    func propose(_ coordinate: Coordinate, label: String = "") {
+    func propose(_ coordinate: Coordinate, label: String = "", provenance: DestinationProvenance = .manual,
+                 inboxItem: UUID? = nil) {
         guard stage == .choosing || isFailed else { return }
-        stage = .confirming(PendingDestination(coordinate: coordinate, label: label))
+        stage = .confirming(PendingDestination(coordinate: coordinate, label: label, provenance: provenance,
+                                               inboxItem: inboxItem))
     }
 
     func proposePasted(_ text: String) -> DestinationParseError? {
@@ -222,8 +363,11 @@ final class AppModel {
 
     func cancelDestination() {
         switch stage {
-        case .confirming, .failed: stage = .choosing
-        default: break
+        case .confirming(let pending), .failed(let pending, _):
+            if let item = pending.inboxItem { inbox.setStatus(item, .pending) }
+            stage = .choosing
+        default:
+            break
         }
     }
 
@@ -231,9 +375,10 @@ final class AppModel {
         case home, work
     }
 
-    func confirmDestination(label: String, saveAsFavourite: Bool, shortcut: Shortcut? = nil) {
+    func confirmDestination(label: String, saveAsFavourite: Bool, shortcut: Shortcut? = nil, stop: Favourite? = nil) {
         guard case .confirming(var pending) = stage else { return }
         pending.label = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        pending.stop = stop.map { RideDestination(coordinate: $0.coordinate, label: $0.label, provenance: .saved) }
         if saveAsFavourite {
             favourites.add(label: pending.label, coordinate: pending.coordinate)
             persistFavourites()
@@ -241,9 +386,13 @@ final class AppModel {
         if let shortcut { setShortcut(shortcut, label: pending.label, coordinate: pending.coordinate) }
         places.recordRecent(label: pending.label, coordinate: pending.coordinate)
         persistPlaces()
+        if let item = pending.inboxItem { inbox.setStatus(item, .accepted) }
+        let final = RideDestination(coordinate: pending.coordinate, label: pending.label, provenance: pending.provenance)
+        guard let context = RideContext(itinerary: Itinerary(final: final, stop: pending.stop),
+                                        preferences: routePreferences) else { return }
         switch mode {
-        case .simulation: beginSimulatedRoute(pending)
-        case .live: requestLiveRoute(pending)
+        case .simulation: beginSimulatedRoute(pending, context: context)
+        case .live: requestRoute(.initial, context: context, pending: pending)
         }
     }
 
@@ -256,7 +405,7 @@ final class AppModel {
     /// One tap: Home, Work, a recent or favourite goes straight to route options.
     func navigate(to place: Favourite) {
         guard stage == .choosing || isFailed else { return }
-        stage = .confirming(PendingDestination(coordinate: place.coordinate, label: place.label))
+        stage = .confirming(PendingDestination(coordinate: place.coordinate, label: place.label, provenance: .saved))
         confirmDestination(label: place.label, saveAsFavourite: false)
     }
 
@@ -277,92 +426,6 @@ final class AppModel {
         persistPlaces()
     }
 
-    func clearRecents() {
-        places.clearRecents()
-        persistPlaces()
-    }
-
-    private func persistPlaces() {
-        defaults.set(try? JSONEncoder().encode(places), forKey: Self.placesKey)
-    }
-
-    // MARK: Shared and pasted links
-
-    /// Text or a link from the Share extension, the clipboard or an n250ride:// URL.
-    func handleIncoming(_ text: String) {
-        guard stage == .choosing || isFailed else {
-            linkMessage = "Finish the current ride before opening a new destination."
-            return
-        }
-        switch MapLinkParser.parse(text) {
-        case .place(let coordinate, let name):
-            accept(coordinate, name: name)
-        case .needsExpansion(let url):
-            linkMessage = "Opening shared link…"
-            Task {
-                let expanded = await LinkExpander.expand(url)
-                if let expanded, case .place = MapLinkParser.parse(url: expanded) {
-                    handleIncoming(expanded.absoluteString)
-                } else {
-                    linkMessage = "Couldn't read a location from that link."
-                }
-            }
-        case nil:
-            linkMessage = "No location found in what was shared."
-        }
-    }
-
-    /// n250ride://open?ll=12.97,77.59&name=Office or n250ride://open?link=<url>.
-    func handleOpenURL(_ url: URL) {
-        guard url.scheme == "n250ride" else { return }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        let value = { (name: String) in items.first { $0.name == name }?.value }
-        if let link = value("link") {
-            handleIncoming(link)
-        } else if let ll = value("ll"), let coordinate = MapLinkParser.coordinateText(ll) {
-            guard stage == .choosing || isFailed else {
-                linkMessage = "Finish the current ride before opening a new destination."
-                return
-            }
-            accept(coordinate, name: value("name"))
-        }
-    }
-
-    private func accept(_ coordinate: Coordinate, name: String?) {
-        linkMessage = nil
-        selectedTab = .ride
-        propose(coordinate, label: name ?? "")
-    }
-
-    func checkShareInbox() {
-        if let text = ShareInbox.take() { handleIncoming(text) }
-    }
-
-    func startNavigation() {
-        guard case .preview(let pending) = stage else { return }
-        stage = .navigating(pending)
-        voice.reset()
-        liveActivity.start(destination: RideView.title(pending))
-        switch mode {
-        case .simulation: fixture?.start()
-        case .live: provider?.startGuidance()
-        }
-    }
-
-    func stopNavigation() {
-        fixture?.stop()
-        fixture = nil
-        provider?.stop()
-        coordinator.endSession()
-        updateNavigationState()
-        voice.reset()
-        liveActivity.end()
-        stage = .choosing
-        routeOptions = []
-        selectedRouteID = nil
-        guidance = nil
-    }
-
     func renameFavourite(_ id: UUID, to label: String) {
         favourites.rename(id, to: label)
         persistFavourites()
@@ -373,6 +436,122 @@ final class AppModel {
         persistFavourites()
     }
 
+    func clearRecents() {
+        places.clearRecents()
+        persistPlaces()
+    }
+
+    /// Places that can be picked as the stop on the way.
+    var stopCandidates: [Favourite] {
+        var seen = Set<Coordinate>()
+        return ([places.home, places.work].compactMap { $0 } + favourites.items + places.recents)
+            .filter { seen.insert($0.coordinate).inserted }
+    }
+
+    private func persistPlaces() {
+        defaults.set(try? JSONEncoder().encode(places), forKey: Self.placesKey)
+    }
+
+    // MARK: Shared and pasted links
+
+    /// Text or a link from the Share extension, the clipboard or an n250ride:// URL.
+    /// It is saved to the inbox first; it opens straight away only between rides.
+    func handleIncoming(_ text: String) {
+        _ = receiveIncoming(text)
+    }
+
+    @discardableResult
+    private func receiveIncoming(_ text: String) -> Bool {
+        let added: IncomingInbox.AddResult
+        switch MapLinkParser.parse(text) {
+        case .place(let coordinate, let name):
+            added = inbox.add(coordinate: coordinate, label: name ?? "", link: nil, now: clock.wallNow)
+        case .needsExpansion(let url):
+            added = inbox.add(coordinate: nil, label: "", link: url.absoluteString, now: clock.wallNow)
+        case nil:
+            linkMessage = "No location found in what was shared."
+            return false
+        }
+        switch added {
+        case .added(let id), .duplicate(let id):
+            if stage == .choosing || isFailed {
+                openInboxItem(id)
+            } else {
+                linkMessage = "Destination saved. Open it from the Ride screen when you're ready."
+            }
+            return true
+        case .full:
+            linkMessage = "Ten destinations are already waiting. Remove one first."
+        case .tooLarge:
+            linkMessage = "That link is too long to keep."
+        case .storageFailed:
+            linkMessage = "Couldn't save that destination on this phone."
+        }
+        return false
+    }
+
+    /// Opens a waiting destination in the confirmation screen, resolving a short link first.
+    func openInboxItem(_ id: UUID) {
+        guard stage == .choosing || isFailed, let item = inbox.item(id) else { return }
+        if let coordinate = item.coordinate {
+            linkMessage = nil
+            selectedTab = .ride
+            inbox.setStatus(id, .reserved)
+            propose(coordinate, label: item.label, provenance: .shared, inboxItem: id)
+            return
+        }
+        guard let link = item.link.flatMap(URL.init(string:)) else {
+            inbox.setStatus(id, .failed("No location in this link."))
+            return
+        }
+        linkMessage = "Opening shared link…"
+        Task { [weak self] in
+            let expanded = await LinkExpander.expand(link)
+            guard let self, inbox.item(id) != nil else { return }
+            if let expanded, case .place(let coordinate, let name) = MapLinkParser.parse(url: expanded) {
+                inbox.resolve(id, coordinate: coordinate, label: name)
+                openInboxItem(id)
+            } else {
+                inbox.setStatus(id, .failed("Couldn't read a location from that link."))
+                linkMessage = "Couldn't read a location from that link."
+            }
+        }
+    }
+
+    func discardInboxItem(_ id: UUID) {
+        inbox.discard(id)
+    }
+
+    /// n250ride://open?ll=12.97,77.59&name=Office or n250ride://open?link=<url>.
+    func handleOpenURL(_ url: URL) {
+        guard url.scheme == "n250ride" else { return }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let value = { (name: String) in items.first { $0.name == name }?.value }
+        if let link = value("link") {
+            handleIncoming(link)
+        } else if let ll = value("ll"), let coordinate = MapLinkParser.coordinateText(ll) {
+            let result = inbox.add(coordinate: coordinate, label: value("name") ?? "", link: nil, now: clock.wallNow)
+            switch result {
+            case .added(let id), .duplicate(let id):
+                if stage == .choosing || isFailed {
+                    openInboxItem(id)
+                } else {
+                    linkMessage = "Destination saved. Open it from the Ride screen when you're ready."
+                }
+            default:
+                linkMessage = "Couldn't save that destination on this phone."
+            }
+        }
+    }
+
+    /// Copies the Share extension's hand-off into the inbox, then clears it.
+    func checkShareInbox() {
+        guard let text = ShareInbox.peek() else { return }
+        if receiveIncoming(text) || MapLinkParser.parse(text) == nil { ShareInbox.clear() }
+    }
+
+    // MARK: Ride lifecycle
+
     func acceptTerms() {
         provider?.requestTerms { [weak self] accepted in self?.termsAccepted = accepted }
     }
@@ -382,9 +561,16 @@ final class AppModel {
         return false
     }
 
-    private func beginSimulatedRoute(_ pending: PendingDestination) {
+    var isRiding: Bool {
+        if case .navigating = stage { return true }
+        return false
+    }
+
+    private func beginSimulatedRoute(_ pending: PendingDestination, context: RideContext) {
         let session = SessionID()
         coordinator.beginSession(session)
+        ride = context
+        arrivalFinalized = false
         let route = FixtureRoute.demo
         let source = FixtureNavigationSource(route: route, clock: clock)
         source.onSnapshot = { [weak self] in self?.receive($0) }
@@ -402,31 +588,47 @@ final class AppModel {
         selectedTab = .ride
     }
 
-    /// Chooses between the candidates of the one request already made.
+    /// Chooses between the candidates of the one request already made. No request.
     func selectRoute(_ id: RouteOption.ID) {
         guard case .preview = stage, routeOptions.contains(where: { $0.id == id }) else { return }
         if mode == .live {
-            guard provider?.selectRoute(id) == true else { return }
+            guard let proposal, provider?.previewPrepared(proposal.handle, option: id) == true else { return }
         }
         selectedRouteID = id
     }
 
-    private func requestLiveRoute(_ pending: PendingDestination) {
-        guard let provider, termsAccepted else {
-            stage = .failed(pending, "Accept the navigation notice first.")
-            return
+    /// Authorises and prepares one route. Nothing active changes until commit.
+    private func requestRoute(_ reason: RouteReason, context: RideContext, pending: PendingDestination,
+                              fix: FixRequirement? = nil) {
+        // The synthetic replay never contacts a route provider.
+        guard let provider, mode == .live else { return }
+        let opensPreview = reason == .initial || reason == .recovery || reason == .nextLeg
+        if opensPreview {
+            guard termsAccepted else {
+                stage = .failed(pending, "Accept the navigation notice first.")
+                return
+            }
+            switch locationAuthorization() {
+            case .denied, .restricted:
+                record(.permission(.locationDenied))
+                stage = .failed(pending, "Location access is off. Enable it in Settings > N250 Ride > Location.")
+                return
+            case .notDetermined:
+                locationManager.requestWhenInUseAuthorization()
+                stage = .failed(pending, "Allow location access when asked, then tap Try again.")
+                return
+            default:
+                break
+            }
+        } else if reason.keepsSession || reason == .replacement {
+            guard provider.supportsTransactionalReplacement || reason.keepsSession else {
+                routeOperation = .failed(reason, "This navigation provider can't change the route during a ride.")
+                return
+            }
         }
-        switch locationAuthorization() {
-        case .denied, .restricted:
-            record(.permission(.locationDenied))
-            stage = .failed(pending, "Location access is off. Enable it in Settings > N250 Ride > Location.")
+        if operation != nil {
+            // One calculation at a time: a second tap or an automatic trigger joins it.
             return
-        case .notDetermined:
-            locationManager.requestWhenInUseAuthorization()
-            stage = .failed(pending, "Allow location access when asked, then tap Try again.")
-            return
-        default:
-            break
         }
 
         let ticket: RouteTicket
@@ -436,66 +638,554 @@ final class AppModel {
             record(.routeRequest(.authorized))
         case .failure(let denial):
             record(.routeRequest(.init(denial)))
-            if denial != .requestInFlight {
+            guard denial != .requestInFlight else { return }
+            if opensPreview {
                 stage = .failed(pending, Self.message(for: denial))
+            } else if reason != .offRoute {
+                routeOperation = .failed(reason, Self.message(for: denial))
             }
             return
         }
 
-        let session = SessionID()
-        coordinator.beginSession(session)
-        stage = .requesting(pending)
-        provider.requestRoute(to: pending.coordinate, title: pending.label.isEmpty ? "Destination" : pending.label,
-                            session: session, generation: coordinator.generation) { [weak self] result in
-            guard let self else { return }
-            routeGate.finish(ticket)
-            switch result {
-            case .success(let options):
-                record(.routeRequest(.succeeded))
-                showOptions(options, for: pending)
-            case .failure(let failure):
-                record(.routeRequest(Self.summary(for: failure)))
-                coordinator.endSession()
-                stage = .failed(pending, failure.message)
-            }
+        let id = UUID()
+        let keeps = reason.keepsSession
+        let session = keeps ? (coordinator.session ?? SessionID()) : SessionID()
+        let generation = keeps ? coordinator.generation.next : RouteGeneration(0)
+        let deadline = timers.schedule(after: Self.operationDeadline) { [weak self] in self?.operationTimedOut(id) }
+        operation = Operation(id: id, ticket: ticket, reason: reason, context: context, session: session,
+                              generation: generation, pending: pending, deadline: deadline)
+        if opensPreview {
+            stage = .requesting(pending)
+        } else {
+            routeOperation = .preparing(reason)
         }
+        updateHealth()
+        let target = context.activeTarget
+        let request = NavigationRouteRequest(
+            operationID: id, session: session, generation: generation, target: target.coordinate,
+            title: target.label.isEmpty ? "Destination" : target.label, preferences: context.preferences,
+            reason: reason, alternatives: opensPreview,
+            fix: fix ?? (reason == .initial ? .initial : .current))
+        provider.prepareRoute(request) { [weak self] result in self?.prepared(id, result) }
     }
 
-    /// Throttled by the guidance engine; serialised and debounced by the route gate.
-    /// The coordinator moves to the new generation only once the new route exists, so
-    /// the dashboard stays cleared ("rerouting") meanwhile and old callbacks are rejected.
-    private func reroute() {
-        guard case .navigating = stage, let provider, let session = coordinator.session else { return }
-        let ticket: RouteTicket
-        switch routeGate.authorize(destinationCount: 1) {
-        case .success(let granted): ticket = granted
-        case .failure(let denial):
-            record(.routeRequest(.init(denial)))
-            return
-        }
-        record(.routeRequest(.authorized))
-        provider.reroute(session: session, generation: coordinator.generation.next) { [weak self] result in
-            guard let self else { return }
-            routeGate.finish(ticket)
-            switch result {
-            case .success:
+    private func finishOperation(_ op: Operation) {
+        op.deadline.cancel()
+        routeGate.finish(op.ticket)
+        operation = nil
+    }
+
+    private func operationTimedOut(_ id: UUID) {
+        guard operation?.id == id else { return }
+        provider?.cancelPreparation(id)
+        prepared(id, .failure(.timedOut))
+    }
+
+    /// The answer to the calculation `id`. Answers for anything else are ignored.
+    private func prepared(_ id: UUID, _ result: Result<PreparedRoute, RouteRequestFailure>) {
+        guard let op = operation, op.id == id else { return }
+        finishOperation(op)
+        switch result {
+        case .failure(let failure):
+            record(.routeRequest(Self.summary(for: failure)))
+            switch op.reason {
+            case .initial, .recovery:
+                stage = .failed(op.pending, failure.message)
+            case .nextLeg:
+                stage = .atStop(op.pending)
+                routeOperation = .failed(.nextLeg, failure.message)
+            case .manual, .offRoute, .replacement:
+                routeOperation = .failed(op.reason, failure.message)
+            }
+        case .success(let route):
+            record(.routeRequest(.succeeded))
+            switch op.reason {
+            case .initial, .recovery, .nextLeg:
+                let expiry = timers.schedule(after: Self.previewLifetime) { [weak self] in
+                    guard let self, self.proposal?.handle == route.handle else { return }
+                    self.previewExpired = true
+                }
+                proposal = Proposal(handle: route.handle, reason: op.reason, context: op.context, session: op.session,
+                                    expiry: expiry)
+                previewExpired = false
+                startStatus = .idle
+                routeOperation = .idle
+                showOptions(route.options, for: op.pending)
+            case .manual, .offRoute:
+                guard isRiding, provider?.commitPreparedRoute(route.handle, option: route.options[0].id) == true,
+                      coordinator.session == op.session else {
+                    routeOperation = .failed(op.reason, "The new route couldn't be used.")
+                    break
+                }
                 coordinator.replaceRoute()
-                record(.routeRequest(.succeeded))
-            case .failure(let failure):
-                record(.routeRequest(Self.summary(for: failure)))
+                history.breakSegment()
+                routeOperation = .idle
+            case .replacement:
+                guard isRiding, provider?.commitPreparedRoute(route.handle, option: route.options[0].id) == true else {
+                    routeOperation = .failed(.replacement, "The new route couldn't be used.")
+                    break
+                }
+                commitReplacement(op)
+            }
+        }
+        updateHealth()
+    }
+
+    /// Start: check the rider is still where the route begins, then commit.
+    func startNavigation() {
+        guard case .preview(let pending) = stage else { return }
+        if mode == .simulation {
+            stage = .navigating(pending)
+            arrivalFinalized = false
+            voice.reset()
+            liveActivity.start(destination: RideView.title(pending))
+            fixture?.start()
+            scheduleWake()
+            return
+        }
+        guard let proposal, let provider else { return }
+        guard !previewExpired else {
+            startStatus = .blocked("This route is more than two minutes old. Recalculate before starting.")
+            return
+        }
+        startStatus = .checking
+        provider.checkStart(proposal.handle) { [weak self] check in
+            guard let self, self.proposal?.handle == proposal.handle, case .preview = self.stage else { return }
+            switch check {
+            case .ready:
+                commitStart(proposal, pending: pending)
+            case .noCurrentFix:
+                startStatus = .blocked("No current GPS fix. Move to open sky and tap Start again.")
+            case .movedFromOrigin(let metres):
+                startStatus = .blocked("You've moved \(metres) m from where this route starts. Recalculate before starting.")
             }
         }
     }
+
+    private func commitStart(_ proposal: Proposal, pending: PendingDestination) {
+        let now = clock.wallNow
+        recovery.recordPendingStart(proposal.context, reason: proposal.reason.rawValue, now: now)
+        guard let selected = selectedRouteID,
+              provider?.commitPreparedRoute(proposal.handle, option: selected) == true else {
+            recovery.clearPendingStart()
+            startStatus = .blocked("This route can't be started. Recalculate.")
+            return
+        }
+        // No snapshot can have arrived yet: the provider emits only on later fixes.
+        coordinator.beginSession(proposal.session)
+        proposal.expiry.cancel()
+        self.proposal = nil
+        let resumed = proposal.reason == .recovery || proposal.reason == .nextLeg
+        ride = proposal.context
+        stage = .navigating(pending)
+        startStatus = .idle
+        arrivalFinalized = false
+        recoveryOffer = nil
+        voice.reset()
+        liveActivity.start(destination: RideView.title(pending))
+        provider?.startGuidance()
+        if !resumed || rideStartedAt == nil { rideStartedAt = now }
+        recovery.commit(proposal.context, startedAt: rideStartedAt ?? now, now: now)
+        history.begin(proposal.context.id, startedAt: rideStartedAt ?? now, now: now)
+        if let item = pending.inboxItem { inbox.consume(item) }
+        updateHealth()
+        scheduleWake()
+    }
+
+    /// The route changed mid-ride (skip stop, add stop, new destination): new session, generation zero.
+    private func commitReplacement(_ op: Operation) {
+        let newJourney = op.context.id != ride?.id
+        coordinator.beginSession(op.session)
+        let now = clock.wallNow
+        if newJourney {
+            history.finish(.endedByRider, now: now)
+            if let old = ride { recovery.finish(old.id, now: now) }
+            rideStartedAt = now
+            history.begin(op.context.id, startedAt: now, now: now)
+        } else {
+            history.breakSegment()
+        }
+        ride = op.context
+        stage = .navigating(op.pending)
+        arrivalFinalized = false
+        voice.reset()
+        if newJourney { liveActivity.start(destination: RideView.title(op.pending)) }
+        recovery.commit(op.context, startedAt: rideStartedAt ?? now, now: now)
+        if let item = op.pending.inboxItem { inbox.consume(item) }
+        routeOperation = .idle
+    }
+
+    /// Calculates the current preview again (it expired or the rider moved).
+    func recalculatePreview() {
+        guard case .preview(let pending) = stage, let old = proposal else { return }
+        provider?.discardPrepared(old.handle)
+        old.expiry.cancel()
+        proposal = nil
+        startStatus = .idle
+        requestRoute(old.reason, context: old.context, pending: pending)
+    }
+
+    /// Cancel on the preview: back to where the rider came from, nothing requested.
+    func cancelPreview() {
+        guard case .preview(let pending) = stage else { return }
+        if mode == .simulation { return stopNavigation() }
+        guard let old = proposal else { return stopNavigation() }
+        provider?.discardPrepared(old.handle)
+        old.expiry.cancel()
+        proposal = nil
+        startStatus = .idle
+        routeOptions = []
+        selectedRouteID = nil
+        switch old.reason {
+        case .nextLeg:
+            stage = .atStop(pending)
+        default:
+            if let item = pending.inboxItem { inbox.setStatus(item, .pending) }
+            if old.reason == .initial { ride = nil }
+            stage = .choosing
+        }
+        updateHealth()
+    }
+
+    /// Recalculate from where the rider is now. Automatic triggers and repeated taps
+    /// share the one in-flight calculation; the gate's cooldown still applies.
+    func requestReroute(_ reason: RouteReason = .manual) {
+        guard case .navigating(let pending) = stage, let ride, coordinator.session != nil else { return }
+        if operation != nil { return }
+        if reason == .offRoute, case .failed = routeOperation {
+            // A failed automatic reroute is retried only by the rider.
+            return
+        }
+        requestRoute(reason, context: ride, pending: pending)
+    }
+
+    func cancelRouteOperation() {
+        guard let op = operation else { return }
+        provider?.cancelPreparation(op.id)
+        finishOperation(op)
+        record(.routeRequest(.cancelled))
+        switch op.reason {
+        case .initial, .recovery:
+            stage = .choosing
+        case .nextLeg:
+            stage = .atStop(op.pending)
+        default:
+            break
+        }
+        routeOperation = .idle
+        updateHealth()
+    }
+
+    func dismissRouteError() {
+        if case .failed = routeOperation { routeOperation = .idle }
+        updateHealth()
+    }
+
+    func stopNavigation() {
+        if let op = operation {
+            provider?.cancelPreparation(op.id)
+            finishOperation(op)
+        }
+        if let proposal {
+            provider?.discardPrepared(proposal.handle)
+            proposal.expiry.cancel()
+            self.proposal = nil
+        }
+        let wasRiding: Bool = switch stage {
+        case .navigating, .atStop: true
+        default: false
+        }
+        if case .preview(let pending) = stage, let item = pending.inboxItem { inbox.setStatus(item, .pending) }
+        fixture?.stop()
+        fixture = nil
+        provider?.stop()
+        coordinator.endSession()
+        updateNavigationState()
+        voice.reset()
+        liveActivity.end()
+        if wasRiding, let ride, mode == .live {
+            if !arrivalFinalized { history.finish(.endedByRider, now: clock.wallNow) }
+            recovery.finish(ride.id, now: clock.wallNow)
+        }
+        ride = nil
+        rideStartedAt = nil
+        stage = .choosing
+        routeOptions = []
+        selectedRouteID = nil
+        guidance = nil
+        routeOperation = .idle
+        startStatus = .idle
+        previewExpired = false
+        updateHealth()
+        scheduleWake()
+    }
+
+    // MARK: Stops
+
+    /// Before the stop: go straight to the final destination (new route, explicit).
+    func skipStop() {
+        guard case .navigating = stage, let ride, case .success(let next) = ItineraryPolicy.skipStop(ride) else { return }
+        if mode == .simulation { return restartSimulation(next) }
+        requestRoute(.replacement, context: next, pending: Self.pending(for: next))
+    }
+
+    /// At the stop: calculate the leg to the final destination; Start begins it.
+    func continueToFinal() {
+        guard case .atStop = stage, let ride, case .success(let next) = ItineraryPolicy.continueToFinal(ride) else { return }
+        routeOperation = .idle
+        if mode == .simulation {
+            fixture = nil
+            stage = .choosing
+            beginSimulatedRoute(Self.pending(for: next), context: next)
+            return
+        }
+        requestRoute(.nextLeg, context: next, pending: Self.pending(for: next), fix: .current)
+    }
+
+    /// The synthetic replay has no routes to prepare: the next leg starts at once.
+    private func restartSimulation(_ next: RideContext) {
+        fixture?.stop()
+        coordinator.endSession()
+        stage = .choosing
+        beginSimulatedRoute(Self.pending(for: next), context: next)
+        startNavigation()
+    }
+
+    /// Adds one stop on the way while riding (from the inbox or saved places).
+    func addStop(_ stop: RideDestination, inboxItem: UUID? = nil) {
+        guard case .navigating = stage, let ride else { return }
+        switch ItineraryPolicy.addStop(stop, to: ride) {
+        case .success(let next):
+            if mode == .simulation { return restartSimulation(next) }
+            var pending = Self.pending(for: next)
+            pending.inboxItem = inboxItem
+            requestRoute(.replacement, context: next, pending: pending)
+        case .failure(.alreadyHasStop):
+            routeOperation = .failed(.replacement, "This ride already has a stop. Skip it first.")
+        case .failure:
+            routeOperation = .failed(.replacement, "A stop can't be added right now.")
+        }
+    }
+
+    /// Replaces the final destination mid-ride. The old route stays until the new one is ready.
+    func replaceDestination(with itemID: UUID) {
+        guard case .navigating = stage, let item = inbox.item(itemID), let coordinate = item.coordinate,
+              let context = RideContext(itinerary: Itinerary(final: RideDestination(
+                coordinate: coordinate, label: item.label, provenance: .shared)), preferences: routePreferences)
+        else { return }
+        if mode == .simulation {
+            inbox.consume(itemID)
+            return restartSimulation(context)
+        }
+        var pending = Self.pending(for: context)
+        pending.inboxItem = itemID
+        inbox.setStatus(itemID, .accepted)
+        requestRoute(.replacement, context: context, pending: pending)
+    }
+
+    static func pending(for context: RideContext) -> PendingDestination {
+        let target = context.activeTarget
+        return PendingDestination(coordinate: target.coordinate, label: target.label, provenance: target.provenance,
+                                  stop: context.itinerary.stop)
+    }
+
+    private func handleArrival() {
+        guard !arrivalFinalized, let ride else { return }
+        switch ItineraryPolicy.arrival(ride) {
+        case .reachedStop(let next):
+            // End leg one completely: no session, cleared dashboard, nothing spoken for it.
+            fixture?.stop()
+            fixture = nil
+            provider?.stop()
+            coordinator.endSession()
+            voice.reset()
+            self.ride = next
+            history.breakSegment()
+            recovery.commit(next, startedAt: rideStartedAt ?? clock.wallNow, now: clock.wallNow)
+            guidance = nil
+            stage = .atStop(Self.pending(for: next))
+        case .completed:
+            arrivalFinalized = true
+            if mode == .live {
+                history.finish(.completed, now: clock.wallNow)
+                recovery.finish(ride.id, now: clock.wallNow)
+            }
+        case .ignored:
+            break
+        }
+    }
+
+    // MARK: Recovery
+
+    /// Resume after an interruption: a fresh position measured after this tap, a new
+    /// authorised route, a preview, then Start. Nothing old is restored as active.
+    func resumeRecovery(usePending: Bool = true) {
+        guard stage == .choosing, let offer = recoveryOffer else { return }
+        let context: RideContext
+        switch offer {
+        case .resume(let intent):
+            context = intent.context
+            rideStartedAt = intent.startedAt
+        case .unfinishedStart(let pending, let previous):
+            if !usePending, let previous {
+                context = previous.context
+                rideStartedAt = previous.startedAt
+            } else {
+                context = pending.context
+            }
+        }
+        recovery.clearPendingStart()
+        if context.phase == .atStop {
+            ride = context
+            recoveryOffer = nil
+            stage = .atStop(Self.pending(for: context))
+            updateHealth()
+            return
+        }
+        guard mode == .live else { return }
+        requestRoute(.recovery, context: context, pending: Self.pending(for: context),
+                     fix: FixRequirement(maxAge: 5, maxAccuracy: 50, measuredAfter: clock.wallNow))
+    }
+
+    func discardRecovery() {
+        recovery.discard()
+        recoveryOffer = nil
+        updateHealth()
+    }
+
+    // MARK: Snapshots
 
     private func receive(_ snapshot: NavigationSnapshot) {
+        counters.snapshots += 1
         if case .success = coordinator.receive(snapshot) {
             guidance = snapshot
-            if case .navigating = stage {
-                if voiceEnabled { voice.handle(snapshot) }
-                liveActivity.update(snapshot, linkReady: bike.state.isReady)
+            updateNavigationState()
+            if snapshot.state == .arrived, isRiding { handleArrival() }
+            updateHealth()
+            if isRiding {
+                voice.handle(snapshot, eligible: health.directionEligible)
+                liveActivity.update(snapshot, health: health, linkReady: bike.state.isReady, staleDate: staleDate)
             }
         }
         updateNavigationState()
+    }
+
+    func repeatInstruction() {
+        voice.repeatCurrent(eligible: health.directionEligible)
+    }
+
+    // MARK: Health
+
+    private static let idleHealthInput = RideHealthInput(
+        phase: .idle, position: .none, navigationState: .idle, intent: .clear(.noSession), route: .ok,
+        link: .notPaired, delivery: .linkDown, voice: .off)
+
+    /// When the newest genuine position stops being evidence, on the wall clock.
+    private var staleDate: Date? {
+        guard let measured = guidance?.measurementAt else { return nil }
+        let remaining = (measured + RideHealthEvaluator.maxMeasurementAge).duration(since: clock.now)
+        return clock.wallNow.addingTimeInterval(max(remaining.seconds, 0))
+    }
+
+    private func updateHealth() {
+        let phase: RideHealthInput.Phase = switch stage {
+        case .choosing: recoveryOffer == nil ? .idle : .recoveryOffered
+        case .confirming, .failed: .idle
+        case .requesting: .preparing
+        case .preview: .preview
+        case .navigating: .navigating
+        case .atStop: .atStop
+        }
+        let position: RideHealthInput.Position
+        switch locationAuthorization() {
+        case .denied, .restricted:
+            position = .permissionDenied
+        default:
+            if mode == .simulation {
+                position = guidance?.measurementAt.map { .measured(age: clock.now.duration(since: $0), accuracy: 5) } ?? .none
+            } else if let fix = provider?.lastFix {
+                position = .measured(age: clock.now.duration(since: fix.measuredAt), accuracy: fix.sample.horizontalAccuracy)
+            } else {
+                position = .none
+            }
+        }
+        let route: RideHealthInput.RouteStatus = switch routeOperation {
+        case .idle: .ok
+        case .preparing: .calculating
+        case .failed(_, let message): .failed(message)
+        }
+        let link: RideHealthInput.Link = switch bike.state {
+        case .ready: .ready
+        case .connecting, .discovering, .reconnecting, .scanning: .connecting
+        default: bike.rememberedBikeID == nil ? .notPaired : .down
+        }
+        let voiceState: RideHealthInput.Voice = !voiceEnabled ? .off : (voice.holdReason.map { .held($0) } ?? .ok)
+        let next = RideHealthEvaluator.evaluate(RideHealthInput(
+            phase: phase, position: position, navigationState: navigationState, intent: intent, route: route,
+            link: link, delivery: coordinator.delivery, voice: voiceState))
+        if next != health { health = next }
+    }
+
+    // MARK: Scheduling
+
+    /// One wake at the earliest deadline anyone has; none when nothing is due.
+    private func scheduleWake() {
+        var deadlines: [MonotonicInstant] = []
+        if let due = coordinator.nextDeadline { deadlines.append(due) }
+        if fixture != nil, isRiding { deadlines.append(clock.now + Self.fixtureTick) }
+        if isRiding, let measured = guidance?.measurementAt {
+            let expiry = measured + RideHealthEvaluator.maxMeasurementAge
+            if expiry > clock.now { deadlines.append(expiry) }
+        }
+        guard let earliest = deadlines.min() else {
+            wake?.cancel()
+            wake = nil
+            wakeAt = nil
+            return
+        }
+        let at = max(earliest, clock.now + Self.minimumWake)
+        if let wakeAt, wake != nil, wakeAt <= at { return }
+        wake?.cancel()
+        wakeAt = at
+        wake = timers.schedule(after: at.duration(since: clock.now)) { [weak self] in self?.wakeUp() }
+    }
+
+    /// Processes everything due, in order: freshness and output first, then resends
+    /// and status, then presentation. Reschedules itself only for future work.
+    private func wakeUp() {
+        wake = nil
+        wakeAt = nil
+        counters.wakes += 1
+        fixture?.tick()
+        coordinator.phoneStatus = customStatusEnabled ? customPhoneStatus : Self.currentPhoneStatus()
+        coordinator.tick()
+        updateNavigationState()
+        updateHealth()
+        if isRiding, let guidance {
+            liveActivity.update(guidance, health: health, linkReady: bike.state.isReady, staleDate: staleDate)
+        }
+        scheduleWake()
+    }
+
+    private func linkChanged() {
+        let link = DiagnosticsLog.LinkSummary(bike.state)
+        if link != lastLinkSummary {
+            lastLinkSummary = link
+            record(.link(link))
+        }
+        updateHealth()
+        scheduleWake()
+    }
+
+    var activityUpdates: Int { liveActivity.updates }
+
+    func resetCounters() {
+        counters = EnergyCounters()
+    }
+
+    private func applyEnergyMode() {
+        liveActivity.minimumInterval = energySaving ? 10 : 2
+        provider?.setFollowAnimations(!energySaving)
     }
 
     // MARK: Parked diagnostics
@@ -569,9 +1259,41 @@ final class AppModel {
 
     func useSearchSuggestion(_ suggestion: PlaceSearch.Suggestion) {
         search.resolve(suggestion) { [weak self] coordinate, name in
-            self?.propose(coordinate, label: name)
+            self?.propose(coordinate, label: name, provenance: .searchResult)
             self?.search.clear()
         }
+    }
+
+    /// The Bluetooth console is sending its own status packets; the app's pause meanwhile.
+    func holdStatusForConsole(_ hold: Bool) {
+        guard hold != consoleHoldsStatus else { return }
+        consoleHoldsStatus = hold
+        updateStatusPause()
+        if statusProfile != nil {
+            console.note(hold ? "App's status packets paused for this test." : "App's status packets resumed.")
+        }
+    }
+
+    private func callChanged(_ active: Bool) {
+        voice.callChanged(active)
+        updateHealth()
+        guard active != callInProgress else { return }
+        callInProgress = active
+        updateStatusPause()
+        if statusProfile != nil {
+            console.note(active ? "Phone call: status packets paused so the dashboard keeps the call."
+                                : "Call over: status packets resumed.")
+        }
+    }
+
+    /// Status packets pause while either a call or the console holds them; both must end.
+    private func updateStatusPause() {
+        coordinator.statusPaused = callInProgress || consoleHoldsStatus
+    }
+
+    func allowPhoneSpeaker() {
+        voice.allowSpeaker()
+        updateHealth()
     }
 
     func setStatusProfile(_ profile: GeneralStatusProfile?) {
@@ -612,24 +1334,6 @@ final class AppModel {
         defaults.set(try? JSONEncoder().encode(favourites), forKey: Self.favouritesKey)
     }
 
-    private func startTicker() {
-        ticker = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(200))
-                guard let self else { return }
-                fixture?.tick()
-                coordinator.phoneStatus = customStatusEnabled ? customPhoneStatus : Self.currentPhoneStatus()
-                coordinator.tick()
-                updateNavigationState()
-                let link = DiagnosticsLog.LinkSummary(bike.state)
-                if link != lastLinkSummary {
-                    lastLinkSummary = link
-                    record(.link(link))
-                }
-            }
-        }
-    }
-
     /// Real battery bars and media volume for the status packet; defaults when unknown (simulator).
     static func currentPhoneStatus() -> PhoneStatus {
         let level = UIDevice.current.batteryLevel
@@ -658,7 +1362,7 @@ final class AppModel {
         case .quotaExceeded: .failedQuota
         case .keyNotAuthorized: .failedKey
         case .cancelled: .cancelled
-        case .throttled, .locationUnavailable, .other: .failedOther
+        case .throttled, .locationUnavailable, .timedOut, .other: .failedOther
         }
     }
 }

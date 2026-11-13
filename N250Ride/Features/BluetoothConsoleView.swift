@@ -65,12 +65,12 @@ struct BluetoothConsoleView: View {
                 }
                 .pickerStyle(.segmented)
                 ForEach(BluetoothConsole.presets(statusProfile: presetProfile)) { preset in
-                    Button(preset.name) { console.use(preset) }
+                    Button(preset.name) { console.run(preset) }
                 }
             } header: {
                 Text("Experiments")
             } footer: {
-                Text("Tapping fills in the bytes; nothing is sent until you press Send. Status-packet experiments need Diagnostics → Status packet set to Off.")
+                Text("Tapping an experiment sends it straight away. Call experiments pause the app's own status packets until you send Call ended or leave the console.")
             }
 
             Section {

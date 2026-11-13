@@ -70,7 +70,9 @@ struct ShareView: View {
             case .sent:
                 Image(systemName: "checkmark.circle.fill").font(.system(size: 56)).foregroundStyle(.green)
                 Text("Sent to N250 Ride").font(.title2.weight(.semibold))
-                Text("Open N250 Ride to choose a route.").foregroundStyle(.secondary)
+                Text("Open N250 Ride soon to keep it: until the app opens, a phone restart can lose it.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
             case .noLocation:
                 Image(systemName: "mappin.slash").font(.system(size: 56)).foregroundStyle(.orange)
                 Text("No location found").font(.title2.weight(.semibold))

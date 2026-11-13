@@ -115,7 +115,8 @@ enum GoogleGuidanceMapper {
             state: state(fields.navState),
             step: fields.step.flatMap(step),
             remainingMetres: metres(fields.distanceToDestinationMetres),
-            remainingSeconds: metres(fields.timeToDestinationSeconds)
+            remainingSeconds: metres(fields.timeToDestinationSeconds),
+            measurementAt: observedAt
         )
     }
 

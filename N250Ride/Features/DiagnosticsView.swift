@@ -30,8 +30,14 @@ struct DiagnosticsView: View {
                         Label("Bluetooth console", systemImage: "terminal")
                     }
                     .accessibilityIdentifier("bluetoothConsoleLink")
+                    NavigationLink {
+                        ManualChecklistView()
+                    } label: {
+                        Label("Manual checklist", systemImage: "checklist")
+                    }
+                    .accessibilityIdentifier("manualChecklistLink")
                 } footer: {
-                    Text("Send raw bytes to the dashboard and watch its buttons. Parked bike only.")
+                    Text("Send raw bytes to the dashboard and watch its buttons, or test every feature the owner's manual lists. Parked bike only.")
                 }
 
                 Section {
@@ -90,6 +96,18 @@ struct DiagnosticsView: View {
                 }
 
                 CustomStatusSection()
+
+                Section {
+                    LabeledContent("Wakes", value: "\(model.counters.wakes)")
+                    LabeledContent("Snapshots", value: "\(model.counters.snapshots)")
+                    LabeledContent("Lock Screen updates", value: "\(model.activityUpdates)")
+                    LabeledContent("Since", value: model.counters.startedAt.formatted(date: .omitted, time: .shortened))
+                    Button("Reset counters") { model.resetCounters() }
+                } header: {
+                    Text("Energy counters")
+                } footer: {
+                    Text("Compare rides with Energy saving on and off. Counts, not a battery measurement.")
+                }
 
                 Section("Recent frames") {
                     ForEach(model.recentFrames) { frame in

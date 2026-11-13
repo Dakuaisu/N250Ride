@@ -20,6 +20,8 @@ struct RideView: View {
 
                 switch model.stage {
                 case .choosing, .confirming:
+                    if model.recoveryOffer != nil { RecoveryPrompt() }
+                    WaitingDestinations()
                     DestinationPicker()
                 case .requesting(let pending):
                     Section {
@@ -28,11 +30,15 @@ struct RideView: View {
                             Text("Finding routes to \(Self.title(pending))…")
                         }
                         .padding(.vertical, 8)
+                        Button("Cancel", role: .cancel) { model.cancelRouteOperation() }
+                            .accessibilityIdentifier("cancelRequestButton")
                     }
                 case .preview(let pending):
                     RouteChoice(pending: pending)
                 case .navigating(let pending):
                     Navigating(pending: pending)
+                case .atStop(let pending):
+                    AtStop(pending: pending)
                 case .failed(_, let message):
                     Section {
                         Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -71,6 +77,7 @@ struct RideView: View {
         switch model.stage {
         case .navigating: "Navigating"
         case .preview: "Choose a route"
+        case .atStop: "At your stop"
         default: "Where to?"
         }
     }
@@ -181,7 +188,32 @@ private struct RouteChoice: View {
             Text(model.mode == .simulation ? "Synthetic demo route" : model.provider?.routingLabel ?? "")
         }
 
+        if let stop = pending.stop {
+            Section {
+                Label("Stop on the way: \(stop.label.isEmpty ? "unnamed place" : stop.label)", systemImage: "mappin.and.ellipse")
+            } footer: {
+                Text("Times and distances are for the leg to the stop. The rest is calculated when you continue from it.")
+            }
+        }
+
         Section {
+            switch model.startStatus {
+            case .checking:
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text("Checking your position…")
+                }
+            case .blocked(let reason):
+                Label(reason, systemImage: "location.slash").foregroundStyle(.orange)
+                    .accessibilityIdentifier("startBlocked")
+                Button("Recalculate") { model.recalculatePreview() }
+            case .idle:
+                if model.previewExpired {
+                    Label("This route is more than two minutes old.", systemImage: "clock.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                    Button("Recalculate") { model.recalculatePreview() }
+                }
+            }
             Button {
                 model.startNavigation()
             } label: {
@@ -191,13 +223,14 @@ private struct RouteChoice: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .disabled(model.startStatus == .checking || model.previewExpired)
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
             .accessibilityIdentifier("startNavigationButton")
         }
 
         Section {
-            Button("Cancel", role: .cancel) { model.stopNavigation() }
+            Button("Cancel", role: .cancel) { model.cancelPreview() }
                 .frame(maxWidth: .infinity)
                 .accessibilityIdentifier("cancelPreviewButton")
         }
@@ -224,22 +257,49 @@ private struct Navigating: View {
 
     var body: some View {
         Section {
-            TurnCard(snapshot: model.guidance)
-            if model.navigationState == .rerouting {
-                Label("Off route - finding a new route", systemImage: "arrow.triangle.branch")
-                    .foregroundStyle(.orange)
-            }
-            if model.navigationState == .noLocation {
-                Label("Waiting for GPS", systemImage: "location.slash").foregroundStyle(.orange)
-            }
-            if !model.bike.state.isReady {
-                Label("Bike not connected - dashboard not updating", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
+            TurnCard(snapshot: model.guidance, eligible: model.health.directionEligible)
+            RideHealthView(health: model.health)
         } header: {
             Text("To \(RideView.title(pending))")
         } footer: {
             DashboardIntentView(intent: model.intent)
+        }
+
+        if !model.inbox.waiting.isEmpty {
+            Section {
+                NavigationLink {
+                    QueuedDestinationsView()
+                } label: {
+                    Label("\(model.inbox.waiting.count) destination\(model.inbox.waiting.count == 1 ? "" : "s") waiting",
+                          systemImage: "tray.full")
+                }
+                .accessibilityIdentifier("queuedDestinations")
+            }
+        }
+
+        Section {
+            RouteOperationRow()
+            if model.voiceEnabled {
+                Button {
+                    model.repeatInstruction()
+                } label: {
+                    Label("Repeat instruction", systemImage: "speaker.wave.2")
+                }
+                .disabled(!model.health.directionEligible)
+                .accessibilityIdentifier("repeatInstructionButton")
+            }
+            if model.ride?.phase == .toStop {
+                Button {
+                    model.skipStop()
+                } label: {
+                    Label("Skip the stop", systemImage: "forward.end")
+                }
+                .accessibilityIdentifier("skipStopButton")
+            }
+        } header: {
+            Text("Controls")
+        } footer: {
+            Text("Use these only while parked, or ask a pillion to.")
         }
 
         Section {
@@ -260,13 +320,17 @@ private struct Navigating: View {
     }
 }
 
-/// Large next-turn display: arrow, distance, road, arrival time.
+/// Large next-turn display: arrow, distance, road, arrival time. No arrow is
+/// drawn unless ride health says guidance is current.
 struct TurnCard: View {
     let snapshot: NavigationSnapshot?
+    var eligible = true
 
     var body: some View {
         HStack(spacing: 16) {
-            Image(systemName: Self.symbol(for: snapshot?.state == .arrived ? .arrival : snapshot?.step?.maneuver))
+            Image(systemName: eligible || snapshot?.state == .arrived
+                  ? Self.symbol(for: snapshot?.state == .arrived ? .arrival : snapshot?.step?.maneuver)
+                  : "exclamationmark.triangle")
                 .font(.system(size: 56, weight: .bold))
                 .frame(width: 72)
                 .foregroundStyle(Color.accentColor)
@@ -275,10 +339,10 @@ struct TurnCard: View {
                     .font(.largeTitle.weight(.bold))
                     .minimumScaleFactor(0.6)
                     .lineLimit(1)
-                if snapshot?.state == .active, let road = snapshot?.step?.roadText {
+                if eligible, snapshot?.state == .active, let road = snapshot?.step?.roadText {
                     Text(road).font(.headline).lineLimit(2)
                 }
-                if snapshot?.state == .active, let remaining = snapshot?.remainingSeconds,
+                if eligible, snapshot?.state == .active, let remaining = snapshot?.remainingSeconds,
                    let metres = snapshot?.remainingMetres {
                     Text("Arrive \(Date().addingTimeInterval(TimeInterval(remaining)).formatted(date: .omitted, time: .shortened)) · \(Format.distance(Double(metres))) · \(Format.duration(Double(remaining)))")
                         .font(.subheadline)
@@ -294,6 +358,7 @@ struct TurnCard: View {
 
     private var headline: String {
         guard let snapshot else { return "Starting…" }
+        if !eligible, snapshot.state == .active { return "Paused" }
         switch snapshot.state {
         case .arrived: return "Arrived"
         case .active:

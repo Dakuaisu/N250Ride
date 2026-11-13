@@ -11,6 +11,8 @@ struct MapTabView: View {
                 ProviderMapHost(view: provider.mapHostView)
                     .ignoresSafeArea(edges: .top)
                     .accessibilityLabel("Map. Long-press to choose a destination.")
+                    .onAppear { provider.setMapVisible(true) }
+                    .onDisappear { provider.setMapVisible(false) }
 
                 HStack(spacing: 12) {
                     Label(hint, systemImage: hintSymbol)
@@ -43,6 +45,7 @@ struct MapTabView: View {
         case .requesting: "Finding routes…"
         case .preview: "Blue is your selected route"
         case .navigating: "Navigating"
+        case .atStop: "At your stop"
         }
     }
 

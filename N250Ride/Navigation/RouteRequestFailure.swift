@@ -10,6 +10,8 @@ enum RouteRequestFailure: Error, Equatable {
     case keyNotAuthorized
     case locationUnavailable
     case cancelled
+    /// Took longer than the 30-second limit for one route calculation.
+    case timedOut
     case other(String)
 
     var message: String {
@@ -22,6 +24,7 @@ enum RouteRequestFailure: Error, Equatable {
         case .keyNotAuthorized: "The Google API key is not authorised for the Navigation SDK."
         case .locationUnavailable: "Current location unavailable. Check Location permission and GPS signal."
         case .cancelled: "Route request cancelled."
+        case .timedOut: "Finding a route took too long. Try again."
         case .other(let detail): "Route failed (\(detail))."
         }
     }

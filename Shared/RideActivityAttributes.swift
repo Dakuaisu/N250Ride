@@ -14,6 +14,10 @@ struct RideActivityAttributes: ActivityAttributes {
         var arrival: Date?
         var remaining: String
         var warning: Bool
+
+        /// Shown once the position behind the content has expired: never a direction.
+        static let stale = ContentState(symbol: "exclamationmark.triangle", headline: "Guidance paused",
+                                        detail: "Open N250 Ride", arrival: nil, remaining: "", warning: true)
     }
 
     var destination: String

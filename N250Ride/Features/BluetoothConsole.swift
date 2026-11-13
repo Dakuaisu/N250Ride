@@ -29,6 +29,8 @@ final class BluetoothConsole {
         let name: String
         let target: String
         let bytes: [UInt8]
+        /// Hands the status channel back to the app once sent.
+        var endsStatusTest = false
     }
 
     static let controlChannel = "0A10676E-6972-6565-6E69-676E4543544F"
@@ -62,7 +64,7 @@ final class BluetoothConsole {
     var targets: [Target] {
         let explored = bike.gattServices.flatMap(\.characteristics)
             .filter { characteristic in
-                !BikeConnection.isBlocked(characteristic.id)
+                !BikeConnection.isBlocked(characteristic.id, service: characteristic.serviceID)
                     && !Self.knownTargets.contains { $0.id == characteristic.id.uppercased() }
                     && (characteristic.properties.contains(.write) || characteristic.properties.contains(.writeWithoutResponse))
             }
@@ -96,6 +98,7 @@ final class BluetoothConsole {
             confirmingUnknown = true
             return
         }
+        if target == ClusterGATT.generalStatus { host?.holdStatusForConsole(true) }
         if let problem = bike.rawWrite(bytes, to: target, withResponse: withResponse) {
             return log(.error, target, problem)
         }
@@ -109,10 +112,16 @@ final class BluetoothConsole {
         log(.info, ClusterGATT.navigation, "Clear sent")
     }
 
-    func use(_ preset: Preset) {
+    func run(_ preset: Preset) {
         target = preset.target
         hexText = HexBytes.format(preset.bytes)
         fixChecksum = true
+        send()
+        if preset.endsStatusTest { host?.holdStatusForConsole(false) }
+    }
+
+    func note(_ text: String) {
+        log(.info, ClusterGATT.generalStatus, text)
     }
 
     func explore() {
@@ -149,6 +158,7 @@ final class BluetoothConsole {
     func stop() {
         setPolling(false)
         host?.clearTestFrame()
+        host?.holdStatusForConsole(false)
     }
 
     func clearLog() {
@@ -265,7 +275,8 @@ final class BluetoothConsole {
                    bytes: GeneralStatusEncoder.encode(statusProfile, GeneralStatusFields(
                        heartbeat: 1, callState: .incoming, callerName: "TEST"))),
             Preset(name: "Call ended (\(statusProfile.rawValue))", target: status,
-                   bytes: GeneralStatusEncoder.encode(statusProfile, GeneralStatusFields(heartbeat: 2, callState: .ended))),
+                   bytes: GeneralStatusEncoder.encode(statusProfile, GeneralStatusFields(heartbeat: 2, callState: .ended)),
+                   endsStatusTest: true),
         ]
     }
 }
