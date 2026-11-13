@@ -719,3 +719,14 @@ did not change). No device checks.
 | 6 | Throttled Live Activity text could delay freshness renewal; a change back to the shown text stayed queued | Freshness renewal and text throttling are scheduled independently; returning to the shown text drops the held change. |
 | 7 | Unreadable inbox/history/recovery data could not be discarded from the app | Confirmation-backed Discard buttons in Waiting destinations, Ride history and Ride settings. |
 | 8 | The pump didn't wait for an outstanding console write; unacknowledged console writes ignored readiness | The pump holds a channel while a console write on it awaits its answer; console writes time out after 3 s (link retired) and unacknowledged ones respect Bluetooth readiness. Production callback interleaving remains a device gate. |
+
+### Third review round (2026-11-13)
+
+Three further issues, all confirmed and fixed; each new test was run against the previous code and failed there.
+Verified: 158 core and 102 app unit tests pass. No device checks.
+
+| # | Issue | Fix |
+| --- | --- | --- |
+| 1 | A status packet already queued in the pump could still be written after a call/console pause began | Pausing (or turning status packets off) discards the unsent app status packet; one already in flight can't be recalled. |
+| 2 | With recovery off at launch, an unchecked unreadable journal could be deleted when a ride ended | With recovery off, ending a ride never touches the file; with it on, the file is read before any cleanup and kept if unreadable. |
+| 3 | An arrival reported synchronously inside `startGuidance()` was overwritten by the rest of Start | Recovery, history and inbox state are committed before guidance starts; the Apple provider handles its cached fix last. |
