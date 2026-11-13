@@ -37,8 +37,13 @@ final class RideHistoryStore {
     @ObservationIgnored private var contents = Contents()
     @ObservationIgnored private var recording: Recording?
     @ObservationIgnored private let file: RecordFile<Contents>
+    @ObservationIgnored private let defaults: UserDefaults
+    /// Set before an opt-out is written and cleared once it is stored, so an opt-out
+    /// whose file write failed still holds after a restart.
+    private static let optOutPendingKey = "historyOptOutPending"
 
-    init(directory: URL, now: Date, io: RecordIO = .real) {
+    init(directory: URL, now: Date, defaults: UserDefaults = .standard, io: RecordIO = .real) {
+        self.defaults = defaults
         file = RecordFile(directory: directory, name: "history.json", schemaVersion: 1, maxBytes: 512 * 1_024, io: io)
         do {
             contents = try file.load() ?? Contents()
@@ -56,21 +61,42 @@ final class RideHistoryStore {
         let kept = RideHistoryPolicy.pruned(contents.rides, now: now)
         changed = changed || kept != contents.rides
         contents.rides = kept
+        if defaults.bool(forKey: Self.optOutPendingKey) {
+            // A previous opt-out couldn't be stored: it still applies.
+            if contents.consentEpoch != nil || contents.draft != nil { changed = true }
+            contents.consentEpoch = nil
+            contents.draft = nil
+        }
         rides = contents.rides
         if changed { save() }
+        if defaults.bool(forKey: Self.optOutPendingKey), !isBlocked, problem == nil {
+            defaults.removeObject(forKey: Self.optOutPendingKey)
+        }
     }
 
+    /// Turning history off stops recording at once and is never undone by a failed save:
+    /// the choice is also kept in preferences until the history file records it.
     func setEnabled(_ on: Bool) {
         let before = contents
         if on {
             guard contents.consentEpoch == nil else { return }
             contents.consentEpoch = UUID()
+            if save() {
+                defaults.removeObject(forKey: Self.optOutPendingKey)
+            } else {
+                contents = before
+            }
         } else {
+            defaults.set(true, forKey: Self.optOutPendingKey)
             contents.consentEpoch = nil
             contents.draft = nil
             recording = nil
+            if save() {
+                defaults.removeObject(forKey: Self.optOutPendingKey)
+            } else {
+                problem = "History is off and nothing is recorded, but the change couldn't be saved to the history file. It will be applied again next time the app opens."
+            }
         }
-        if !save(), on { contents = before }
     }
 
     /// Explicitly throws away stored history that couldn't be read.

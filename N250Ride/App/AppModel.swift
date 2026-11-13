@@ -157,6 +157,9 @@ final class AppModel {
     @ObservationIgnored private var wakeAt: MonotonicInstant?
     @ObservationIgnored private var rideStartedAt: Date?
     @ObservationIgnored private var arrivalFinalized = false
+    /// A journey was started (or restored at its stop) and hasn't been finished yet, even
+    /// while the screen shows the next leg's calculation or preview.
+    @ObservationIgnored private var journeyStarted = false
 
     /// The one calculation in flight. Its gate ticket is released exactly once,
     /// whichever comes first: the answer, the 30-second deadline, Cancel or Stop.
@@ -236,7 +239,7 @@ final class AppModel {
         let now = clock.wallNow
         recovery = RecoveryStore(directory: deps.storage, defaults: defaults)
         inbox = IncomingInbox(directory: deps.storage, now: now)
-        history = RideHistoryStore(directory: deps.storage, now: now)
+        history = RideHistoryStore(directory: deps.storage, now: now, defaults: defaults)
         let info = Bundle.main.infoDictionary ?? [:]
         setup = BikeSetupModel(directory: deps.storage,
                                appVersion: "\(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?"))")
@@ -821,6 +824,7 @@ final class AppModel {
         // Everything the ride records is set up before guidance starts: the first fix
         // can arrive synchronously inside startGuidance() and may already be an arrival.
         if !resumed || rideStartedAt == nil { rideStartedAt = now }
+        journeyStarted = true
         recovery.commit(proposal.context, startedAt: rideStartedAt ?? now, now: now)
         switch proposal.reason {
         case .nextLeg: history.continueRide(proposal.context.id)
@@ -944,12 +948,13 @@ final class AppModel {
         updateNavigationState()
         voice.reset()
         liveActivity.end()
-        if wasRiding, let ride, mode == .live {
+        if wasRiding || journeyStarted, let ride, mode == .live {
             if !arrivalFinalized { history.finish(.endedByRider, now: clock.wallNow) }
             recovery.finish(ride.id, now: clock.wallNow)
         }
         ride = nil
         rideStartedAt = nil
+        journeyStarted = false
         stage = .choosing
         routeOptions = []
         selectedRouteID = nil
@@ -995,6 +1000,10 @@ final class AppModel {
     /// Adds one stop on the way while riding (from the inbox or saved places).
     func addStop(_ stop: RideDestination, inboxItem: UUID? = nil) {
         guard case .navigating = stage, let ride else { return }
+        guard !arrivalFinalized else {
+            routeOperation = .failed(.replacement, "You've arrived. End this ride, then start a new one from there.")
+            return
+        }
         switch ItineraryPolicy.addStop(stop, to: ride) {
         case .success(let next):
             if mode == .simulation { return restartSimulation(next) }
@@ -1093,6 +1102,7 @@ final class AppModel {
             ride = context
             // Leg two continues the recording only if leg one was being recorded under current consent.
             history.resume(context.id, now: clock.wallNow)
+            journeyStarted = true
             recoveryOffer = nil
             stage = .atStop(Self.pending(for: context))
             updateHealth()

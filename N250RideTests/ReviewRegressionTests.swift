@@ -693,6 +693,102 @@ struct ThirdReviewRegressionTests {
     }
 }
 
+
+/// Fourth review round.
+@MainActor
+struct FourthReviewRegressionTests {
+    // 1
+    @Test func noStopCanBeAddedAfterArrival() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r4a-\(UUID())")!
+        let h = RideHarness(storage: storage, defaults: defaults)
+        h.model.recovery.setEnabled(true)
+        h.model.history.setEnabled(true)
+        h.startRide()
+        h.emit(.arrived)
+        h.wait()
+        let requests = h.spy.requests.count
+        h.model.addStop(RideDestination(coordinate: h.fuel.coordinate, label: "Fuel", provenance: .shared))
+        #expect(h.spy.requests.count == requests, "a finished journey isn't reopened")
+        #expect(h.model.routeOperation == .failed(.replacement, "You've arrived. End this ride, then start a new one from there."))
+        let restarted = RideHarness(storage: storage, defaults: defaults)
+        #expect(restarted.model.history.rides.map(\.outcome) == [.completed])
+        #expect(restarted.model.recoveryOffer == nil)
+    }
+
+    // 2
+    func reachStop(_ h: RideHarness) {
+        h.model.recovery.setEnabled(true)
+        h.model.history.setEnabled(true)
+        h.startRide(stop: h.fuel)
+        h.emit(.arrived)
+        h.wait()
+        h.model.continueToFinal()
+    }
+
+    @Test func closingTheSecondLegWhileCalculatingEndsTheJourney() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r4b-\(UUID())")!
+        let h = RideHarness(storage: storage, defaults: defaults)
+        reachStop(h)
+        guard case .requesting = h.model.stage else {
+            Issue.record("expected leg two calculating, got \(h.model.stage)")
+            return
+        }
+        h.model.endRideForDiagnostics()
+        let restarted = RideHarness(storage: storage, defaults: defaults)
+        #expect(restarted.model.recoveryOffer == nil, "the abandoned journey isn't offered again")
+        #expect(restarted.model.history.rides.map(\.outcome) == [.endedByRider])
+    }
+
+    @Test func closingTheSecondLegPreviewEndsTheJourney() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r4c-\(UUID())")!
+        let h = RideHarness(storage: storage, defaults: defaults)
+        reachStop(h)
+        h.spy.pendingRoute?(.success(h.spy.options))
+        guard case .preview = h.model.stage else {
+            Issue.record("expected leg two preview, got \(h.model.stage)")
+            return
+        }
+        h.model.endRideForDiagnostics()
+        let restarted = RideHarness(storage: storage, defaults: defaults)
+        #expect(restarted.model.recoveryOffer == nil)
+        #expect(restarted.model.history.rides.map(\.outcome) == [.endedByRider])
+    }
+
+    // 3
+    final class FailSwitch: @unchecked Sendable {
+        var fail = false
+    }
+
+    @Test func failedOptOutStillHoldsAfterRestart() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r4d-\(UUID())")!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let fail = FailSwitch()
+        let io = RecordIO(write: { data, url in
+            if fail.fail { throw CocoaError(.fileWriteOutOfSpace) }
+            try RecordIO.real.write(data, url)
+        }, excludeFromBackup: { try RecordIO.real.excludeFromBackup($0) })
+        let store = RideHistoryStore(directory: storage, now: now, defaults: defaults, io: io)
+        store.setEnabled(true)
+        let ride = RideID()
+        store.begin(ride, startedAt: now, now: now)
+        fail.fail = true
+        store.setEnabled(false)
+        #expect(!store.enabled && !store.isRecording, "recording stops at once")
+        #expect(store.problem?.hasPrefix("History is off") == true, "the failed save is reported")
+
+        let reopened = RideHistoryStore(directory: storage, now: now.addingTimeInterval(60), defaults: defaults)
+        #expect(!reopened.enabled, "the opt-out isn't reverted by the restart")
+        reopened.resume(ride, now: now.addingTimeInterval(60))
+        #expect(!reopened.isRecording, "and the interrupted ride doesn't resume recording")
+        let again = RideHistoryStore(directory: storage, now: now.addingTimeInterval(120), defaults: defaults)
+        #expect(!again.enabled, "once stored, it stays off")
+    }
+}
+
 final class RecordingTransport: ClusterWriteTransport {
     var canSendWriteWithoutResponse = true
     private(set) var writes: [[UInt8]] = []

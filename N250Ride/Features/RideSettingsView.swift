@@ -80,6 +80,8 @@ struct RideSettingsView: View {
                     if model.history.isBlocked {
                         Text("Stored history can't be read. Open Ride history to discard it.")
                             .font(.footnote).foregroundStyle(.orange)
+                    } else if let problem = model.history.problem {
+                        Text(problem).font(.footnote).foregroundStyle(.orange)
                     }
                 } header: {
                     Text("History")
