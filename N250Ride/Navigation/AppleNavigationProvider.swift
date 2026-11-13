@@ -217,8 +217,9 @@ final class AppleNavigationProvider: NSObject, LiveNavigationProvider {
         guiding = true
         drawRoutes()
         acquire(.guidance)
-        if let lastFix, clock.now < lastFix.expiresAt { handle(lastFix) }
         mapView.setUserTrackingMode(.followWithHeading, animated: followAnimations)
+        // Last, because handling this fix may end guidance at once (already at the destination).
+        if let lastFix, clock.now < lastFix.expiresAt { handle(lastFix) }
     }
 
     func stop() {

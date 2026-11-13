@@ -95,7 +95,12 @@ final class SpyProvider: LiveNavigationProvider {
     func recenter() {}
     func setMapVisible(_ visible: Bool) {}
     func setFollowAnimations(_ enabled: Bool) {}
-    func startGuidance() { started += 1 }
+    /// Runs inside startGuidance(), like a real provider handling a fresh cached fix.
+    var onStartGuidance: (() -> Void)?
+    func startGuidance() {
+        started += 1
+        onStartGuidance?()
+    }
     func stop() { stops += 1 }
 }
 

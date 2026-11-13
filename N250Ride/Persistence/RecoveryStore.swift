@@ -74,12 +74,13 @@ final class RecoveryStore {
         var list = finishedList(now: now)
         list.append(FinishedRide(id: ride.raw, at: now))
         defaults.set(try? JSONEncoder().encode(list), forKey: Self.finishedKey)
-        // An unreadable journal is kept until the rider explicitly discards it.
-        if isBlocked {
-            journal = RecoveryJournal()
-        } else {
-            discard()
-        }
+        journal = RecoveryJournal()
+        // With recovery off this ride wrote nothing, so there is nothing of ours to clean up.
+        guard enabled else { return }
+        // Look at the file itself before deleting: an unreadable journal is kept until
+        // the rider explicitly discards it, even if it was never checked this session.
+        _ = try? file.load()
+        if !isBlocked { discard() }
     }
 
     /// A saved ride exists but can't be read; it is preserved until an explicit discard.

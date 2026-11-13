@@ -818,7 +818,8 @@ final class AppModel {
         recoveryOffer = nil
         voice.reset()
         liveActivity.start(destination: RideView.title(pending))
-        provider?.startGuidance()
+        // Everything the ride records is set up before guidance starts: the first fix
+        // can arrive synchronously inside startGuidance() and may already be an arrival.
         if !resumed || rideStartedAt == nil { rideStartedAt = now }
         recovery.commit(proposal.context, startedAt: rideStartedAt ?? now, now: now)
         switch proposal.reason {
@@ -827,6 +828,7 @@ final class AppModel {
         default: history.begin(proposal.context.id, startedAt: rideStartedAt ?? now, now: now)
         }
         if let item = pending.inboxItem { inbox.consume(item) }
+        provider?.startGuidance()
         updateHealth()
         scheduleWake()
     }

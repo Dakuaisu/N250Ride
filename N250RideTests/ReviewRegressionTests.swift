@@ -633,6 +633,66 @@ struct SecondReviewRegressionTests {
     }
 }
 
+
+/// Third review round.
+@MainActor
+struct ThirdReviewRegressionTests {
+    // 2
+    @Test func recoveryOffAtLaunchStillKeepsAnUnreadableFile() throws {
+        let storage = TestStorage.directory()
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let future = Data(#"{"schemaVersion": 99, "payload": {}}"#.utf8)
+        let file = storage.appendingPathComponent("recovery.json")
+        try future.write(to: file)
+        let h = RideHarness(storage: storage)
+        h.startRide()
+        h.model.stopNavigation()
+        #expect(try Data(contentsOf: file) == future, "recovery off: the file is never touched")
+        h.model.recovery.setEnabled(true)
+        h.wait()
+        h.startRide()
+        h.model.stopNavigation()
+        #expect(try Data(contentsOf: file) == future, "enabled mid-session: checked before any cleanup")
+    }
+
+    // 3
+    @Test func arrivalAtTheStopInsideStartIsNotOverwritten() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r3s-\(UUID())")!
+        let h = RideHarness(storage: storage, defaults: defaults)
+        h.model.recovery.setEnabled(true)
+        h.model.history.setEnabled(true)
+        h.spy.onStartGuidance = { h.emit(.arrived) }
+        h.startRide(stop: h.fuel)
+        guard case .atStop = h.model.stage else {
+            Issue.record("expected the stop, got \(h.model.stage)")
+            return
+        }
+        #expect(h.model.ride?.phase == .atStop)
+        #expect(h.model.history.isRecording, "leg one's recording carries on to leg two")
+        let restarted = RideHarness(storage: storage, defaults: defaults)
+        guard case .resume(let intent) = restarted.model.recoveryOffer else {
+            Issue.record("expected an offer")
+            return
+        }
+        #expect(intent.context.phase == .atStop, "the checkpoint at the stop is not replaced by leg one")
+    }
+
+    @Test func arrivalAtTheDestinationInsideStartFinishesTheRide() {
+        let storage = TestStorage.directory()
+        let defaults = UserDefaults(suiteName: "r3f-\(UUID())")!
+        let h = RideHarness(storage: storage, defaults: defaults)
+        h.model.recovery.setEnabled(true)
+        h.model.history.setEnabled(true)
+        h.spy.onStartGuidance = { h.emit(.arrived) }
+        h.startRide()
+        #expect(!h.model.history.isRecording, "a finished ride is not recorded again")
+        #expect(h.model.history.rides.map(\.outcome) == [.completed])
+        #expect(RideHarness(storage: storage, defaults: defaults).model.recoveryOffer == nil,
+                "a finished ride is not offered for recovery")
+    }
+}
+
 final class RecordingTransport: ClusterWriteTransport {
     var canSendWriteWithoutResponse = true
     private(set) var writes: [[UInt8]] = []
