@@ -24,6 +24,15 @@ been verified on the motorcycle:
 - A Live Activity for the Lock Screen and Dynamic Island on supported devices.
 - Synthetic-route simulation, diagnostics, and a parked-only Bluetooth console
   for inspecting and testing cluster communication.
+- Ride health that explains GPS, route, bike and voice problems and never shows a
+  direction from stale position data, on the phone and the Lock Screen.
+- Manual recalculate with cancel and retry; route changes take effect only once
+  the new route is ready.
+- One optional stop on the way, a queue for destinations shared during a ride,
+  opt-in recovery of interrupted rides and opt-in, privacy-limited ride history.
+- Concise or detailed voice with repeat and test, paused during calls or when a
+  headset disconnects; a parked, step-by-step bike compatibility check; an energy
+  saving mode.
 
 ## Routing and current limits
 
