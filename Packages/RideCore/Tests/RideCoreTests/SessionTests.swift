@@ -244,6 +244,17 @@ struct SessionCoordinatorTests {
         #expect(transport.writes.last?.channel == .status)
     }
 
+    @Test func pausingDropsAStatusPacketQueuedBehindAnotherWrite() {
+        let (c, pump) = makeCoordinator(profile: .legacy55)
+        c.linkReady(pump)
+        #expect(transport.writes.map(\.channel) == [.navigation], "the clear is in flight; status waits behind it")
+        c.statusPaused = true
+        ack(pump)
+        #expect(!transport.writes.contains { $0.channel == .status }, "the queued 'no call' packet never goes out")
+        c.statusPaused = false
+        #expect(transport.writes.last?.channel == .status, "resuming sends a fresh one")
+    }
+
     @Test func bluetoothLifecycleNeverRequestsRoutes() {
         let store = InMemoryUsageCounterStore()
         let gate = RouteRequestGate(policy: .metered(RouteRequestLimits()), store: store, clock: clock)

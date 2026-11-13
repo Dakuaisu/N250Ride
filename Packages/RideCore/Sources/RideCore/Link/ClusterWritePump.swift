@@ -131,6 +131,11 @@ public final class ClusterWritePump {
         onProgress?()
     }
 
+    /// Drops an app status packet that hasn't been written yet (one already in flight can't be recalled).
+    public func discardPendingStatus() {
+        pendingStatus = nil
+    }
+
     /// Another owner's write on a channel was answered: queued work may go now.
     public func channelReleased() {
         pump()

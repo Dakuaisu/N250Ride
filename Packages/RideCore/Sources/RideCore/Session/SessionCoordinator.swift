@@ -92,6 +92,7 @@ public final class SessionCoordinator {
     public var statusProfile: GeneralStatusProfile? {
         didSet {
             lastStatusSentAt = nil
+            if statusProfile == nil { pump?.discardPendingStatus() }
             sync()
         }
     }
@@ -101,6 +102,8 @@ public final class SessionCoordinator {
         didSet {
             guard statusPaused != oldValue else { return }
             lastStatusSentAt = nil
+            // A "no call" packet still queued behind another write must not go out during the pause.
+            if statusPaused { pump?.discardPendingStatus() }
             sync()
         }
     }
