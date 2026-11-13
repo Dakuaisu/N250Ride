@@ -62,6 +62,7 @@ final class SimulationUITests: XCTestCase {
         XCTAssertTrue(app.buttons["stopButton"].waitForExistence(timeout: 5))
         XCTAssertFalse(start.exists, "start is single-shot; repeated taps cannot restart the route")
         XCTAssertTrue(app.descendants(matching: .any)["currentTurn"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["rideHealth"].waitForExistence(timeout: 5), "ride health is shown")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "navigating"
         shot.lifetime = .keepAlways
@@ -154,7 +155,7 @@ final class SimulationUITests: XCTestCase {
         app.buttons["Done"].tap()
     }
 
-    func testConsoleFillsPresetWithoutSending() {
+    func testConsolePresetSendsOnTap() {
         app.buttons["Diagnostics"].tap()
         let link = app.buttons["bluetoothConsoleLink"]
         XCTAssertTrue(link.waitForExistence(timeout: 5))
@@ -166,7 +167,54 @@ final class SimulationUITests: XCTestCase {
         for _ in 0..<4 where !app.textViews["consoleHex"].exists && !app.textFields["consoleHex"].exists { app.swipeDown() }
         let hex = app.textViews["consoleHex"].exists ? app.textViews["consoleHex"] : app.textFields["consoleHex"]
         XCTAssertTrue((hex.value as? String ?? "").hasPrefix("01 04 54 45 53 54"))
-        XCTAssertFalse(app.buttons["consoleSend"].isEnabled, "no bike in the simulator, so sending is disabled")
+        let attempt = app.staticTexts["Bike not connected."]
+        for _ in 0..<6 where !attempt.exists { app.swipeUp() }
+        XCTAssertTrue(attempt.waitForExistence(timeout: 5), "tapping sent it; the simulator has no bike")
+    }
+
+    func testManualChecklistSendsAndRecordsResults() {
+        app.buttons["Diagnostics"].tap()
+        let link = app.buttons["manualChecklistLink"]
+        XCTAssertTrue(link.waitForExistence(timeout: 5))
+        link.tap()
+        let send = app.buttons["Turn right, 300 m"].firstMatch
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        send.tap()
+        XCTAssertTrue(app.staticTexts["Last: Bike not connected."].waitForExistence(timeout: 5),
+                      "tapping sent it; the simulator has no bike")
+        let outcome = app.segmentedControls["outcome.nav.turn"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 5))
+        outcome.buttons["Nothing"].tap()
+        XCTAssertTrue(outcome.buttons["Nothing"].isSelected)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label BEGINSWITH '1 of '")).firstMatch.exists)
+    }
+
+    func testBikeCheckWaitsForTheBikeAndTheRider() {
+        app.buttons["Bike"].tap()
+        let link = app.buttons["bikeSetupLink"]
+        XCTAssertTrue(link.waitForExistence(timeout: 5))
+        link.tap()
+        XCTAssertTrue(app.staticTexts["Step 1 of 9: Park safely"].waitForExistence(timeout: 5))
+        app.buttons["setupNext"].tap()
+        XCTAssertTrue(app.staticTexts["Step 2 of 9: Connect"].waitForExistence(timeout: 5))
+        app.buttons["setupNext"].tap()
+        XCTAssertTrue(app.staticTexts["Connect to the bike on the Bike tab first."].waitForExistence(timeout: 5),
+                      "no step is skipped without a connected bike")
+    }
+
+    func testSettingsOfferVoiceHistoryAndRecoveryChoices() {
+        let settings = app.buttons["rideSettingsButton"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        settings.tap()
+        XCTAssertTrue(app.segmentedControls["voiceStylePicker"].waitForExistence(timeout: 5))
+        let recovery = app.switches["recoveryToggle"]
+        for _ in 0..<4 where !recovery.isHittable { app.swipeUp() }
+        recovery.switches.firstMatch.tap()
+        XCTAssertTrue(app.alerts["Keep interrupted rides?"].waitForExistence(timeout: 5), "turning it on explains first")
+        app.alerts.buttons["Cancel"].tap()
+        let history = app.switches["historyToggle"]
+        for _ in 0..<3 where !history.exists { app.swipeUp() }
+        XCTAssertTrue(history.waitForExistence(timeout: 5))
     }
 
     /// The test runner is a separate process from the same developer team, like the

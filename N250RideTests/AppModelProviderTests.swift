@@ -11,6 +11,7 @@ final class SpyProvider: LiveNavigationProvider {
     var onSnapshot: ((NavigationSnapshot) -> Void)?
     var onLongPress: ((Coordinate) -> Void)?
     var onRerouteNeeded: (() -> Void)?
+    var onFix: ((AdmittedFix) -> Void)?
     var routePreferences = RoutePreferences()
     let name = "Spy"
     let routingLabel = "Spy route"
@@ -18,36 +19,73 @@ final class SpyProvider: LiveNavigationProvider {
     var termsAccepted = true
     let sdkVersion: String? = nil
     let mapHostView = UIView()
+    var supportsTransactionalReplacement = true
+    var lastFix: AdmittedFix?
 
+    /// New-destination calculations (initial, recovery, next leg, replacement).
     var routeRequests = 0
+    /// Generations of reroutes on the current session.
     var rerouteRequests: [RouteGeneration] = []
+    var requests: [NavigationRouteRequest] = []
     var pendingRoute: ((Result<[RouteOption], RouteRequestFailure>) -> Void)?
     var pendingReroute: ((Result<Void, RouteRequestFailure>) -> Void)?
+    var cancelled: [UUID] = []
+    var discarded: [PreparedRouteHandle] = []
+    var committed: [PreparedRouteHandle] = []
     var selected: [RouteOption.ID] = []
     var started = 0
+    var stops = 0
+    var startCheck = StartCheck.ready
+    var commitSucceeds = true
+    let origin = Coordinate(latitude: 12.97, longitude: 77.59)!
     let options = [
         RouteOption(id: 0, name: "Outer Ring Road", distanceMetres: 5_400, expectedSeconds: 1_200, hasTolls: false, hasHighways: true),
         RouteOption(id: 2, name: "Old Airport Road", distanceMetres: 5_100, expectedSeconds: 1_380, hasTolls: false, hasHighways: false),
     ]
 
     func requestTerms(completion: @escaping @MainActor (Bool) -> Void) { completion(true) }
-    func requestRoute(to destination: Coordinate, title: String, session: SessionID, generation: RouteGeneration,
-                      completion: @escaping @MainActor (Result<[RouteOption], RouteRequestFailure>) -> Void) {
-        routeRequests += 1
-        pendingRoute = completion
+
+    func prepareRoute(_ request: NavigationRouteRequest,
+                      completion: @escaping @MainActor (Result<PreparedRoute, RouteRequestFailure>) -> Void) {
+        requests.append(request)
+        let handle = PreparedRouteHandle(id: UUID())
+        let origin = origin
+        if request.reason.keepsSession {
+            rerouteRequests.append(request.generation)
+            let first = options[0]
+            pendingReroute = { result in
+                completion(result.map { PreparedRoute(handle: handle, options: [first], origin: origin) })
+            }
+        } else {
+            routeRequests += 1
+            pendingRoute = { result in
+                completion(result.map { PreparedRoute(handle: handle, options: $0, origin: origin) })
+            }
+        }
     }
-    func selectRoute(_ id: RouteOption.ID) -> Bool {
-        selected.append(id)
+
+    func previewPrepared(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool {
+        selected.append(option)
         return true
     }
-    func recenter() {}
-    func reroute(session: SessionID, generation: RouteGeneration,
-                 completion: @escaping @MainActor (Result<Void, RouteRequestFailure>) -> Void) {
-        rerouteRequests.append(generation)
-        pendingReroute = completion
+
+    func checkStart(_ handle: PreparedRouteHandle, completion: @escaping @MainActor (StartCheck) -> Void) {
+        completion(startCheck)
     }
+
+    func commitPreparedRoute(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool {
+        guard commitSucceeds else { return false }
+        committed.append(handle)
+        return true
+    }
+
+    func cancelPreparation(_ operationID: UUID) { cancelled.append(operationID) }
+    func discardPrepared(_ handle: PreparedRouteHandle) { discarded.append(handle) }
+    func recenter() {}
+    func setMapVisible(_ visible: Bool) {}
+    func setFollowAnimations(_ enabled: Bool) {}
     func startGuidance() { started += 1 }
-    func stop() {}
+    func stop() { stops += 1 }
 }
 
 @MainActor
@@ -60,7 +98,7 @@ struct AppModelProviderTests {
         let defaults = UserDefaults(suiteName: "AppModelProviderTests-\(UUID())")!
         model = AppModel(configuration: AppConfiguration(navigationProvider: .apple, googleAPIKey: nil,
                                                          liveNavigationAuthorized: false, provenStatusProfile: nil),
-                         defaults: defaults, provider: spy)
+                         defaults: defaults, provider: spy, dependencies: .test())
         model.locationAuthorization = { .authorizedWhenInUse }
     }
 
@@ -99,6 +137,53 @@ struct AppModelProviderTests {
         #expect(spy.routeRequests == 1)
     }
 
+    @Test func lateRouteAnswerCannotReviveAStoppedRide() async throws {
+        model.propose(destination)
+        model.confirmDestination(label: "", saveAsFavourite: false)
+        let abandoned = try #require(spy.pendingRoute)
+        model.endRideForDiagnostics()
+        abandoned(.success(spy.options))
+        #expect(model.stage == .choosing)
+        #expect(model.routeOptions.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(2_100))
+        model.propose(destination)
+        model.confirmDestination(label: "", saveAsFavourite: false)
+        #expect(spy.routeRequests == 2, "the abandoned request no longer holds the gate")
+        abandoned(.failure(.network))
+        guard case .requesting = model.stage else {
+            Issue.record("a stale failure ended the new request: \(model.stage)")
+            return
+        }
+        spy.pendingRoute?(.success(spy.options))
+        guard case .preview = model.stage else {
+            Issue.record("expected preview, got \(model.stage)")
+            return
+        }
+    }
+
+    @Test func lateRerouteAnswerCannotChangeTheNextRide() async throws {
+        model.propose(destination)
+        model.confirmDestination(label: "", saveAsFavourite: false)
+        spy.pendingRoute?(.success(spy.options))
+        model.startNavigation()
+        try await Task.sleep(for: .milliseconds(2_100))
+        spy.onRerouteNeeded?()
+        let abandoned = try #require(spy.pendingReroute)
+        model.stopNavigation()
+
+        try await Task.sleep(for: .milliseconds(2_100))
+        model.propose(destination)
+        model.confirmDestination(label: "", saveAsFavourite: false)
+        spy.pendingRoute?(.success(spy.options))
+        model.startNavigation()
+        abandoned(.success(()))
+        try await Task.sleep(for: .milliseconds(2_100))
+        spy.onRerouteNeeded?()
+        #expect(spy.rerouteRequests == [RouteGeneration(1), RouteGeneration(1)],
+                "the old reroute did not advance the new ride's route generation")
+    }
+
     @Test func failedRouteIsNotRetriedAutomatically() {
         model.propose(destination)
         model.confirmDestination(label: "", saveAsFavourite: false)
@@ -125,7 +210,7 @@ struct AppModelProviderTests {
         let defaults = UserDefaults(suiteName: "AppModelProviderTests-terms-\(UUID())")!
         let gated = AppModel(configuration: AppConfiguration(navigationProvider: .apple, googleAPIKey: nil,
                                                              liveNavigationAuthorized: false, provenStatusProfile: nil),
-                             defaults: defaults, provider: spy)
+                             defaults: defaults, provider: spy, dependencies: .test())
         gated.locationAuthorization = { .denied }
         gated.propose(destination)
         gated.confirmDestination(label: "", saveAsFavourite: false)
@@ -205,6 +290,27 @@ struct AppModelProviderTests {
         model.endRideForDiagnostics()
         #expect(model.diagnosticsLockReason == nil)
         #expect(model.clearTestFrame() == nil)
+    }
+
+    @Test func callPresetsPauseTheAppsStatusPacketsUntilCallEnded() throws {
+        model.setStatusProfile(.legacy55)
+        let presets = BluetoothConsole.presets(statusProfile: .legacy55)
+        let incoming = try #require(presets.first { $0.name.hasPrefix("Incoming call") })
+        let ended = try #require(presets.first { $0.name.hasPrefix("Call ended") })
+        model.console.run(incoming)
+        #expect(model.console.target == ClusterGATT.generalStatus)
+        model.console.run(ended)
+        let notes = model.console.entries.map(\.text).filter { $0.hasPrefix("App's status packets") }
+        #expect(notes == ["App's status packets resumed.", "App's status packets paused for this test."])
+    }
+
+    @Test func firmwareUpdateChannelsAreBlocked() {
+        for id in ["F000FFC1-0451-4000-B000-000000000000", "f000ffc2-0451-4000-b000-000000000000",
+                   "F000FFC5-0451-4000-B000-000000000000", "F000FFD1-0451-4000-B000-000000000000"] {
+            #expect(BikeConnection.isBlocked(id), "\(id)")
+        }
+        #expect(!BikeConnection.isBlocked(BluetoothConsole.controlChannel))
+        #expect(!BikeConnection.isBlocked("F000FFE1-0451-4000-B000-000000000000"))
     }
 
     @Test func emptyButtonChannelReadsAreReportedOnce() {
