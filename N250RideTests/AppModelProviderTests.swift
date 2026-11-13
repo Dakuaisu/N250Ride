@@ -12,7 +12,6 @@ final class SpyProvider: LiveNavigationProvider {
     var onLongPress: ((Coordinate) -> Void)?
     var onRerouteNeeded: (() -> Void)?
     var onFix: ((AdmittedFix) -> Void)?
-    var routePreferences = RoutePreferences()
     let name = "Spy"
     let routingLabel = "Spy route"
     let termsNotice = "notice"
@@ -70,7 +69,11 @@ final class SpyProvider: LiveNavigationProvider {
     }
 
     func checkStart(_ handle: PreparedRouteHandle, completion: @escaping @MainActor (StartCheck) -> Void) {
-        completion(startCheck)
+        if holdStartChecks {
+            heldStartCheck = { completion($0) }
+        } else {
+            completion(startCheck)
+        }
     }
 
     func commitPreparedRoute(_ handle: PreparedRouteHandle, option: RouteOption.ID) -> Bool {
@@ -80,6 +83,14 @@ final class SpyProvider: LiveNavigationProvider {
     }
 
     func cancelPreparation(_ operationID: UUID) { cancelled.append(operationID) }
+    var cancelledStartChecks: [PreparedRouteHandle] = []
+    var heldStartCheck: ((StartCheck) -> Void)?
+    /// When set, Start position checks wait until the test answers them.
+    var holdStartChecks = false
+    func cancelStartCheck(_ handle: PreparedRouteHandle) {
+        cancelledStartChecks.append(handle)
+        heldStartCheck = nil
+    }
     func discardPrepared(_ handle: PreparedRouteHandle) { discarded.append(handle) }
     func recenter() {}
     func setMapVisible(_ visible: Bool) {}
@@ -91,6 +102,7 @@ final class SpyProvider: LiveNavigationProvider {
 @MainActor
 struct AppModelProviderTests {
     let spy = SpyProvider()
+    let timers = ManualRideTimers(clock: ManualClock())
     let model: AppModel
     let destination = Coordinate(latitude: 12.9716, longitude: 77.5946)!
 
@@ -98,7 +110,7 @@ struct AppModelProviderTests {
         let defaults = UserDefaults(suiteName: "AppModelProviderTests-\(UUID())")!
         model = AppModel(configuration: AppConfiguration(navigationProvider: .apple, googleAPIKey: nil,
                                                          liveNavigationAuthorized: false, provenStatusProfile: nil),
-                         defaults: defaults, provider: spy, dependencies: .test())
+                         defaults: defaults, provider: spy, dependencies: .virtual(timers))
         model.locationAuthorization = { .authorizedWhenInUse }
     }
 
@@ -129,7 +141,7 @@ struct AppModelProviderTests {
         model.confirmDestination(label: "", saveAsFavourite: false)
         spy.pendingRoute?(.success(spy.options))
         model.startNavigation()
-        try await Task.sleep(for: .milliseconds(2_100))
+        timers.advance(by: .milliseconds(2_100))
         spy.onRerouteNeeded?()
         spy.onRerouteNeeded?()
         #expect(spy.rerouteRequests == [RouteGeneration(1)], "second reroute coalesces while one is in flight")
@@ -146,7 +158,7 @@ struct AppModelProviderTests {
         #expect(model.stage == .choosing)
         #expect(model.routeOptions.isEmpty)
 
-        try await Task.sleep(for: .milliseconds(2_100))
+        timers.advance(by: .milliseconds(2_100))
         model.propose(destination)
         model.confirmDestination(label: "", saveAsFavourite: false)
         #expect(spy.routeRequests == 2, "the abandoned request no longer holds the gate")
@@ -167,18 +179,18 @@ struct AppModelProviderTests {
         model.confirmDestination(label: "", saveAsFavourite: false)
         spy.pendingRoute?(.success(spy.options))
         model.startNavigation()
-        try await Task.sleep(for: .milliseconds(2_100))
+        timers.advance(by: .milliseconds(2_100))
         spy.onRerouteNeeded?()
         let abandoned = try #require(spy.pendingReroute)
         model.stopNavigation()
 
-        try await Task.sleep(for: .milliseconds(2_100))
+        timers.advance(by: .milliseconds(2_100))
         model.propose(destination)
         model.confirmDestination(label: "", saveAsFavourite: false)
         spy.pendingRoute?(.success(spy.options))
         model.startNavigation()
         abandoned(.success(()))
-        try await Task.sleep(for: .milliseconds(2_100))
+        timers.advance(by: .milliseconds(2_100))
         spy.onRerouteNeeded?()
         #expect(spy.rerouteRequests == [RouteGeneration(1), RouteGeneration(1)],
                 "the old reroute did not advance the new ride's route generation")
@@ -243,10 +255,11 @@ struct AppModelProviderTests {
         #expect(model.customRawBytesError != nil)
     }
 
-    @Test func routePreferencesReachTheProvider() {
+    @Test func routePreferencesReachTheRequests() {
         model.routePreferences.avoidTolls = true
-        #expect(spy.routePreferences.avoidTolls)
-        #expect(!spy.routePreferences.avoidHighways)
+        model.propose(destination)
+        model.confirmDestination(label: "", saveAsFavourite: false)
+        #expect(spy.requests.last?.preferences == RoutePreferences(avoidTolls: true, avoidHighways: false))
     }
 
     @Test func homeIsOneTapAndRecentsAreRecorded() {

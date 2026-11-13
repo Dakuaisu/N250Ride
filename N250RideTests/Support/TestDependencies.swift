@@ -56,6 +56,37 @@ final class FakeCalls: CallStateSource {
     }
 }
 
+@MainActor
+final class FakeActivitySink: ActivitySink {
+    enum Call: Equatable {
+        case start(String)
+        case update(headline: String, staleDate: Date?)
+        case end
+        case endAll
+    }
+
+    private(set) var calls: [Call] = []
+    /// Simulates a slow ActivityKit: each update waits this long before recording.
+    var updateDelay: Duration = .zero
+
+    func start(destination: String, state: RideActivityAttributes.ContentState) -> String? {
+        calls.append(.start(destination))
+        return "activity"
+    }
+
+    func update(_ id: String, state: RideActivityAttributes.ContentState, staleDate: Date?) async {
+        if updateDelay > .zero { try? await Task.sleep(for: updateDelay) }
+        calls.append(.update(headline: state.headline, staleDate: staleDate))
+    }
+
+    func end(_ id: String) async { calls.append(.end) }
+    func endAll() async { calls.append(.endAll) }
+
+    var staleDates: [Date?] {
+        calls.compactMap { if case .update(_, let date) = $0 { date } else { nil } }
+    }
+}
+
 enum TestStorage {
     static func directory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("N250RideTests-\(UUID().uuidString)", isDirectory: true)
@@ -68,14 +99,15 @@ extension AppDependencies {
     static func test(storage: URL = TestStorage.directory(), calls: FakeCalls = FakeCalls(),
                      speech: FakeSpeech = FakeSpeech(), audio: FakeAudio = FakeAudio()) -> AppDependencies {
         AppDependencies(clock: SystemRideClock(), timers: SystemRideTimers(), storage: storage, calls: calls,
-                        speech: speech, audio: audio, liveActivities: false)
+                        speech: speech, audio: audio, liveActivities: false, activitySink: FakeActivitySink())
     }
 
     /// Virtual time: nothing happens until the test advances the timers.
     @MainActor
     static func virtual(_ timers: ManualRideTimers, storage: URL = TestStorage.directory(), calls: FakeCalls = FakeCalls(),
-                        speech: FakeSpeech = FakeSpeech(), audio: FakeAudio = FakeAudio()) -> AppDependencies {
+                        speech: FakeSpeech = FakeSpeech(), audio: FakeAudio = FakeAudio(),
+                        activities: FakeActivitySink? = nil) -> AppDependencies {
         AppDependencies(clock: timers.clock, timers: timers, storage: storage, calls: calls, speech: speech, audio: audio,
-                        liveActivities: false)
+                        liveActivities: activities != nil, activitySink: activities ?? FakeActivitySink())
     }
 }

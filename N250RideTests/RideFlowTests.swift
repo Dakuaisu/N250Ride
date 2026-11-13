@@ -452,6 +452,7 @@ struct BikeSetupTests {
         report.clearTransport = .pass
         #expect(report.verdict.hasPrefix("Inconclusive"), "a transport acknowledgement is not a visual check")
         for sample in BikeSetupModel.samples { report.samples[sample.id] = .pass }
+        report.arrowAppeared = .pass
         report.stopFrameVisual = .pass
         #expect(report.verdict == "Works as tested (parked)")
         report.samples["left"] = .fail

@@ -2,6 +2,7 @@ import XCTest
 
 /// Real Apple Maps search and routing; network required. Runs only with
 /// TEST_RUNNER_N250_LIVE=1 and the simulator location set (see docs/setup.md).
+@MainActor
 final class LiveAppleRouteUITests: XCTestCase {
     func testSearchRouteChoiceAndStart() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["N250_LIVE"] == "1", "live Apple test not requested")

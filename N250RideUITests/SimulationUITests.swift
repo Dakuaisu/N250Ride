@@ -1,10 +1,11 @@
 import XCTest
 
 /// Runs in simulation mode: synthetic routes, no Apple or Google route requests.
+@MainActor
 final class SimulationUITests: XCTestCase {
     private var app: XCUIApplication!
 
-    override func setUp() {
+    override func setUp() async throws {
         continueAfterFailure = false
         app = XCUIApplication()
         app.launchArguments += ["-simulationMode", "YES", "-disableLiveActivity", "YES"]
