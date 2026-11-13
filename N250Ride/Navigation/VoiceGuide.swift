@@ -33,7 +33,9 @@ protocol AudioSessionClient: AnyObject {
 /// Spoken directions through whatever output the system chose (helmet, earphones,
 /// or the phone speaker when allowed). Holds at most the prompt being spoken and one
 /// pending prompt; anything for another route or after a hold is dropped, never
-/// replayed. Calls, interruptions and a lost headset each hold speech independently.
+/// replayed. Interruptions and a lost headset each hold speech independently.
+/// Phone calls do not: directions keep speaking while a call rings or is connected,
+/// and the audio interruption a call causes is not treated as a hold.
 ///
 /// A turn prompt is spoken only while it is still true: same route and maneuver,
 /// guidance eligible, and its position measurement not yet expired. It is checked
@@ -42,7 +44,7 @@ protocol AudioSessionClient: AnyObject {
 @Observable
 final class VoiceGuide {
     enum Hold: Hashable {
-        case call, interruption, speakerFallback
+        case interruption, speakerFallback
     }
 
     private(set) var holds: Set<Hold> = []
@@ -63,6 +65,7 @@ final class VoiceGuide {
     @ObservationIgnored private var nextTag = 0
     @ObservationIgnored private var lastTestAt: MonotonicInstant?
     @ObservationIgnored private var eligible = false
+    @ObservationIgnored private var callActive = false
 
     static let testInterval: Duration = .seconds(3)
 
@@ -80,7 +83,6 @@ final class VoiceGuide {
 
     /// Why speech is paused, for ride health; nil when it isn't.
     var holdReason: String? {
-        if holds.contains(.call) { return "Voice paused during the call." }
         if holds.contains(.speakerFallback) { return "Headset disconnected - voice paused. Allow the phone speaker?" }
         if holds.contains(.interruption) { return "Voice paused by another app." }
         if activationFailed { return "Audio unavailable - voice can't play." }
@@ -144,8 +146,10 @@ final class VoiceGuide {
                         session: SessionID(), generation: RouteGeneration(0)))
     }
 
+    /// A call never silences directions. The interruption it causes (in either order) is ignored.
     func callChanged(_ active: Bool) {
-        setHold(.call, active)
+        callActive = active
+        if active { holds.remove(.interruption) }
     }
 
     /// Explicit permission to use the phone speaker after the headset went away.
@@ -227,6 +231,7 @@ final class VoiceGuide {
     }
 
     private func interruption(_ began: Bool) {
+        if began, callActive { return }
         setHold(.interruption, began)
     }
 

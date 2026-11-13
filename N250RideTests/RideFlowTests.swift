@@ -460,3 +460,60 @@ struct BikeSetupTests {
         #expect(!report.isCurrent(statusProfile: .legacy55), "evidence is tied to the status profile it used")
     }
 }
+
+@MainActor
+struct CallFlowTests {
+    @Test func navigationContinuesThroughACall() {
+        let h = RideHarness()
+        h.startRide()
+        h.emit(metres: 250)
+        h.calls.set(true)
+        #expect(h.model.statusPaused, "status packets stop so the dashboard keeps the call")
+        h.timers.advance(by: .seconds(1))
+        h.emit(metres: 50)
+        #expect(h.model.health.directionEligible, "guidance continues during the call")
+        if case .guidance = h.model.intent {} else { Issue.record("dashboard arrows continue: \(h.model.intent)") }
+        #expect(h.model.isRiding)
+        h.speech.finish()
+        #expect(h.speech.texts.last == "Now, turn left.", "voice keeps speaking during the call")
+    }
+
+    @Test func callStaysOnTheDashboardAtLeast15Seconds() {
+        let h = RideHarness()
+        h.startRide()
+        h.calls.set(true)
+        h.timers.advance(by: .seconds(3))
+        h.calls.set(false)
+        #expect(h.model.statusPaused, "a call that stopped ringing after 3 s still holds until 15 s")
+        h.timers.advance(by: .milliseconds(11_999))
+        #expect(h.model.statusPaused)
+        h.timers.advance(by: .milliseconds(1))
+        #expect(!h.model.statusPaused, "released 15 s after it started")
+    }
+
+    @Test func longCallHoldsUntilItEnds() {
+        let h = RideHarness()
+        h.calls.set(true)
+        h.timers.advance(by: .seconds(60))
+        #expect(h.model.statusPaused)
+        h.calls.set(false)
+        #expect(!h.model.statusPaused)
+    }
+
+    @Test func callAudioInterruptionDoesNotSilenceDirections() {
+        let clock = ManualClock()
+        let speech = FakeSpeech(), audio = FakeAudio()
+        let voice = VoiceGuide(speech: speech, audio: audio, clock: clock)
+        audio.onInterruption?(true)
+        voice.callChanged(true)
+        audio.onInterruption?(true)
+        #expect(voice.holds.isEmpty && voice.holdReason == nil)
+        voice.handle(NavigationSnapshot(session: SessionID(), generation: RouteGeneration(0), observedAt: clock.now,
+                                        state: .active, step: GuidanceStep(maneuver: .turnRight, distanceMetres: 50, sequence: 1),
+                                        remainingMetres: 500, remainingSeconds: 60, measurementAt: clock.now), eligible: true)
+        #expect(speech.texts == ["Now, turn right."])
+        voice.callChanged(false)
+        audio.onInterruption?(true)
+        #expect(voice.holds == [.interruption], "other interruptions still pause voice")
+    }
+}

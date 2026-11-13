@@ -147,6 +147,10 @@ final class AppModel {
     @ObservationIgnored private let calls: CallStateSource
     @ObservationIgnored private var callInProgress = false
     @ObservationIgnored private var consoleHoldsStatus = false
+    /// The call stays on the dashboard at least this long after it starts ringing.
+    static let callHoldMinimum: Duration = .seconds(15)
+    @ObservationIgnored private var callHoldUntil: MonotonicInstant?
+    @ObservationIgnored private var callHoldTimer: TimerToken?
     @ObservationIgnored private var wake: TimerToken?
     @ObservationIgnored private var wakeAt: MonotonicInstant?
     @ObservationIgnored private var rideStartedAt: Date?
@@ -1327,22 +1331,42 @@ final class AppModel {
         }
     }
 
+    /// A call never stops navigation: guidance, dashboard arrows and voice carry on.
+    /// Only the app's phone-status packets (which say "no call") pause, for the whole
+    /// call and at least 15 s from the first ring, so the dashboard keeps showing it.
     private func callChanged(_ active: Bool) {
         voice.callChanged(active)
         updateHealth()
         guard active != callInProgress else { return }
         callInProgress = active
+        if active {
+            callHoldUntil = clock.now + Self.callHoldMinimum
+            callHoldTimer?.cancel()
+            callHoldTimer = timers.schedule(after: Self.callHoldMinimum) { [weak self] in
+                guard let self else { return }
+                callHoldUntil = nil
+                callHoldTimer = nil
+                updateStatusPause()
+                if !callInProgress, statusProfile != nil { console.note("Call over: status packets resumed.") }
+            }
+        }
         updateStatusPause()
-        if statusProfile != nil {
-            console.note(active ? "Phone call: status packets paused so the dashboard keeps the call."
-                                : "Call over: status packets resumed.")
+        guard statusProfile != nil else { return }
+        if active {
+            console.note("Phone call: status packets paused so the dashboard keeps the call.")
+        } else {
+            console.note(callHoldUntil == nil ? "Call over: status packets resumed."
+                                              : "Call over: status packets resume 15 s after it started ringing.")
         }
     }
 
-    /// Status packets pause while either a call or the console holds them; both must end.
+    /// Status packets pause while a call (and its 15 s minimum) or the console holds them.
     private func updateStatusPause() {
-        coordinator.statusPaused = callInProgress || consoleHoldsStatus
+        let callHold = callInProgress || callHoldUntil.map { clock.now < $0 } ?? false
+        coordinator.statusPaused = callHold || consoleHoldsStatus
     }
+
+    var statusPaused: Bool { coordinator.statusPaused }
 
     func allowPhoneSpeaker() {
         voice.allowSpeaker()
