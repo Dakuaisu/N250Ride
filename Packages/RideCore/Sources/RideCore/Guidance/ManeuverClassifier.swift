@@ -23,7 +23,14 @@ public enum ManeuverClassifier {
     public struct Cues: Sendable, Equatable {
         public var kind: Kind?
         public var side: Side?
+        /// "continue" / "straight": at a roundabout, the exit straight ahead.
+        public var continues = false
+        /// Roundabout exit number ("take the second exit"), when the text gives one.
+        public var exit: Int?
     }
+
+    private static let ordinals = ["first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+                                   "seventh": 7, "eighth": 8]
 
     /// Angles in degrees, positive = right. `near` compares ~30 m either side of the
     /// maneuver point; `far` compares the incoming direction with the route a little
@@ -81,7 +88,32 @@ public enum ManeuverClassifier {
         } else {
             nil
         }
-        return Cues(kind: kind, side: side)
+        let continues = text.contains("continue") || text.contains("straight")
+        var exit: Int?
+        if let match = text.firstMatch(of: /(\w+) exit/) {
+            let word = String(match.1)
+            exit = ordinals[word] ?? word.firstMatch(of: /^(\d)(st|nd|rd|th)$/).flatMap { Int(String($0.1)) }
+        }
+        return Cues(kind: kind, side: side, continues: continues, exit: exit)
+    }
+
+    /// A roundabout from the measured angle between the road in and the road out.
+    /// Apple's wording wins when it is explicit: "continue" is straight, and "turn
+    /// left/right" is that side (a measured direction on the same side is kept).
+    public static func roundabout(_ cues: Cues, angle: Double?, drivingSide: DrivingSide)
+        -> (Maneuver, RoundaboutDirection?) {
+        let maneuver: Maneuver = drivingSide == .left ? .roundaboutClockwise : .roundaboutCounterClockwise
+        var direction = angle.map(roundaboutDirection)
+        let leftSide: Set<RoundaboutDirection> = [.sharpLeft, .left, .slightLeft]
+        let rightSide: Set<RoundaboutDirection> = [.sharpRight, .right, .slightRight]
+        if cues.continues {
+            direction = .straight
+        } else if cues.side == .left, !(direction.map(leftSide.contains) ?? false) {
+            direction = .left
+        } else if cues.side == .right, !(direction.map(rightSide.contains) ?? false) {
+            direction = .right
+        }
+        return (maneuver, direction)
     }
 
     public static func classify(_ cues: Cues, _ geometry: Geometry,

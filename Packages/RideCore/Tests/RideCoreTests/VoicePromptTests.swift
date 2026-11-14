@@ -90,6 +90,10 @@ struct VoicePromptTests {
         #expect(planner.prompt(for: active(.roundaboutClockwise, 280, road: "Ring Road", direction: .straight))
                 == "In 300 metres, at the roundabout, go straight on, towards Ring Road.")
         #expect(planner.prompt(for: active(.arrival, 200, road: nil)) == "In 200 metres, you will arrive at your destination.")
+        var withExit = active(.roundaboutClockwise, 50, road: "Jan Marg", direction: .right)
+        withExit.step?.roundaboutExit = 3
+        #expect(VoicePromptPlanner().repeatPrompt(for: withExit)
+                == "In 50 metres, at the roundabout, take the third exit, to the right, towards Jan Marg.")
         #expect(VoicePromptPlanner.spoken(1_000) == "1 kilometre")
         #expect(VoicePromptPlanner.spoken(20) == "50 metres")
     }

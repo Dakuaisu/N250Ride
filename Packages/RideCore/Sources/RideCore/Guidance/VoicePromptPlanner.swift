@@ -22,17 +22,13 @@ public struct VoicePrompt: Sendable, Equatable {
     public var generation: RouteGeneration
     /// The maneuver a turn prompt is about (its sequence in the route).
     public var step: Int?
-    /// A turn prompt is obsolete from this instant: its position measurement has expired.
-    public var validUntil: MonotonicInstant?
 
-    public init(text: String, priority: Priority, session: SessionID, generation: RouteGeneration,
-                step: Int? = nil, validUntil: MonotonicInstant? = nil) {
+    public init(text: String, priority: Priority, session: SessionID, generation: RouteGeneration, step: Int? = nil) {
         self.text = text
         self.priority = priority
         self.session = session
         self.generation = generation
         self.step = step
-        self.validUntil = validUntil
     }
 }
 
@@ -76,14 +72,8 @@ public struct VoicePromptPlanner: Sendable {
         let status = snapshot.state != .active
         return plan(snapshot).map {
             VoicePrompt(text: $0, priority: status ? .status : .turn, session: snapshot.session,
-                        generation: snapshot.generation, step: status ? nil : snapshot.step?.sequence,
-                        validUntil: status ? nil : Self.validity(snapshot))
+                        generation: snapshot.generation, step: status ? nil : snapshot.step?.sequence)
         }
-    }
-
-    /// Turn prompts expire with the position measurement they were planned from.
-    public static func validity(_ snapshot: NavigationSnapshot) -> MonotonicInstant {
-        (snapshot.measurementAt ?? snapshot.observedAt) + LocationAdmission.maxAge
     }
 
     /// The current instruction again, on request. Nil unless guidance is active.
@@ -166,13 +156,35 @@ public struct VoicePromptPlanner: Sendable {
         case .merge: return "merge" + onto
         case .uTurnLeft, .uTurnRight: return "make a U-turn"
         case .roundaboutClockwise, .roundaboutCounterClockwise:
-            return "at the roundabout, " + roundabout(step.roundaboutDirection)
-                + (road.map { ", towards \($0)" } ?? "")
+            let exit: String
+            if let number = step.roundaboutExit, let word = ordinals[number] {
+                exit = "take the \(word) exit" + (step.roundaboutDirection.map { ", " + heading($0) } ?? "")
+            } else {
+                exit = roundabout(step.roundaboutDirection)
+            }
+            return "at the roundabout, " + exit + (road.map { ", towards \($0)" } ?? "")
         case .ferry: return "take the ferry"
         case .ferryTrain: return "take the train ferry"
         case .arrival: return "you will arrive at your destination"
         case .straight: return "continue straight" + onto
         case .unsupported: return "follow the route"
+        }
+    }
+
+    static let ordinals = [1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
+                           7: "seventh", 8: "eighth"]
+
+    /// Where the numbered exit leads, after the exit number.
+    static func heading(_ direction: RoundaboutDirection) -> String {
+        switch direction {
+        case .straight: "straight on"
+        case .left: "to the left"
+        case .right: "to the right"
+        case .slightLeft: "bearing left"
+        case .slightRight: "bearing right"
+        case .sharpLeft: "sharp left"
+        case .sharpRight: "sharp right"
+        case .uTurn: "all the way round"
         }
     }
 

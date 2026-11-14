@@ -86,10 +86,24 @@ public struct GuidanceUpdate: Sendable, Equatable {
 /// and estimates time remaining. Pure logic driven by injected fixes and times.
 public final class GuidanceEngine {
     struct PlannedManeuver: Equatable {
+        /// Where the maneuver is complete (for a roundabout: where you leave the ring).
         var along: Double
         var maneuver: Maneuver
         var roundaboutDirection: RoundaboutDirection?
         var road: String?
+        /// Where the countdown ends (for a roundabout: where you enter the ring).
+        var countdownAlong: Double
+        var exitNumber: Int?
+
+        init(along: Double, maneuver: Maneuver, roundaboutDirection: RoundaboutDirection? = nil, road: String? = nil,
+             countdownAlong: Double? = nil, exitNumber: Int? = nil) {
+            self.along = along
+            self.maneuver = maneuver
+            self.roundaboutDirection = roundaboutDirection
+            self.road = road
+            self.countdownAlong = countdownAlong ?? along
+            self.exitNumber = exitNumber
+        }
     }
 
     public let session: SessionID
@@ -141,8 +155,19 @@ public final class GuidanceEngine {
             guard along > 0 || !instructions.isEmpty else { continue }
             let next = index + 1 < ends.count ? ends[index + 1] : polyline.length
             let cues = ManeuverClassifier.cues(instructions)
-            let geometry = Self.geometry(polyline, at: along, stepLength: next - along,
-                                         roundabout: cues.kind == .roundabout)
+            if cues.kind == .roundabout {
+                // Apple's roundabout step ends where the route leaves the ring; the ring is
+                // the end of this step. Measure from the road in to the road out.
+                let ring = Self.roundabout(polyline, exit: along, floor: maneuvers.last?.along ?? 0,
+                                           stepAfter: next - along, drivingSide: configuration.drivingSide)
+                let (maneuver, direction) = ManeuverClassifier.roundabout(cues, angle: ring?.angle,
+                                                                          drivingSide: configuration.drivingSide)
+                maneuvers.append(PlannedManeuver(along: along, maneuver: maneuver, roundaboutDirection: direction,
+                                                 road: Self.road(instructions), countdownAlong: ring?.entry,
+                                                 exitNumber: cues.exit))
+                continue
+            }
+            let geometry = Self.geometry(polyline, at: along, stepLength: next - along, roundabout: false)
             let (maneuver, direction) = ManeuverClassifier.classify(cues, geometry,
                                                                     drivingSide: configuration.drivingSide)
             maneuvers.append(PlannedManeuver(along: along, maneuver: maneuver, roundaboutDirection: direction,
@@ -211,9 +236,11 @@ public final class GuidanceEngine {
         let next = maneuvers[index]
         let remaining = max(totalMetres - progressMetres, 0)
         var s = snapshot(.active, at: instant)
-        s.step = GuidanceStep(maneuver: next.maneuver, roundaboutDirection: next.roundaboutDirection,
-                              distanceMetres: Int(max(next.along - progressMetres, 0).rounded()), roadText: next.road,
-                              sequence: index)
+        // A roundabout counts down to its entry and stays current until its exit.
+        s.step = GuidanceStep(maneuver: next.maneuver, roundaboutExit: next.exitNumber,
+                              roundaboutDirection: next.roundaboutDirection,
+                              distanceMetres: Int(max(next.countdownAlong - progressMetres, 0).rounded()),
+                              roadText: next.road, sequence: index)
         s.remainingMetres = Int(remaining.rounded())
         s.remainingSeconds = totalMetres > 0 ? Int((expectedTravelSeconds * remaining / totalMetres).rounded()) : 0
         return s
@@ -239,6 +266,52 @@ public final class GuidanceEngine {
             ? line.bearing(from: along, to: along + reach).map { RoutePolyline.turn(from: incoming, to: $0) }
             : nil
         return ManeuverClassifier.Geometry(near: near, far: far)
+    }
+
+    /// The ring of a roundabout whose exit is at `exit`, and the exit angle.
+    ///
+    /// Walking back from the exit in 5 m pieces, the ring is the stretch that keeps
+    /// turning the way traffic circulates (right for clockwise, left-hand traffic); it
+    /// ends at a turn the other way (the entry flare) or 25 m without turning. The
+    /// angle is the total heading change from the road in (30 m ending 15 m before the
+    /// entry) through the ring to the road out (from 5 m after the exit), summed in
+    /// small steps so a U-turn and sharp turns can't be confused. With no ring in the
+    /// line it is the plain angle between the road before and after the exit.
+    static func roundabout(_ line: RoutePolyline, exit: Double, floor: Double, stepAfter: Double,
+                           drivingSide: DrivingSide) -> (entry: Double, angle: Double)? {
+        let piece = 5.0
+        let circulation = drivingSide == .left ? 1.0 : -1.0
+        let outEnd = exit + max(min(35, stepAfter), 10)
+        guard let out = line.bearing(from: min(exit + 5, outEnd - 5), to: outEnd) else { return nil }
+        var ring: [Double] = []
+        var curved = 0.0, straight = 0.0, firstRingPiece = 0
+        while ring.count < 100, exit - Double(ring.count + 1) * piece >= floor {
+            let k = Double(ring.count)
+            guard let bearing = line.bearing(from: exit - (k + 1) * piece, to: exit - k * piece) else { break }
+            if let later = ring.last {
+                let forward = circulation * RoutePolyline.turn(from: bearing, to: later)
+                if forward < -8, curved >= 10 { break }
+                if forward > 2 {
+                    curved += forward
+                    straight = 0
+                    firstRingPiece = ring.count
+                } else {
+                    straight += piece
+                }
+                if curved >= 20, straight >= 25 { break }
+            }
+            ring.append(bearing)
+        }
+        guard curved >= 20 else {
+            guard let before = line.bearing(from: max(exit - 40, 0), to: max(exit - 5, 1)) else { return nil }
+            return (exit, RoutePolyline.turn(from: before, to: out))
+        }
+        let entry = exit - Double(firstRingPiece + 1) * piece
+        let approachEnd = entry >= 20 ? entry - 15 : entry
+        guard let approach = line.bearing(from: max(approachEnd - 30, 0), to: approachEnd) else { return nil }
+        let path = [approach] + ring[0...firstRingPiece].reversed() + [out]
+        let angle = zip(path, path.dropFirst()).reduce(0.0) { $0 + RoutePolyline.turn(from: $1.0, to: $1.1) }
+        return (entry, angle)
     }
 
     /// Road name after "onto"/"on" in an instruction, if any.
