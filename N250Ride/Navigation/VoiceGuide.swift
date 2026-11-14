@@ -37,9 +37,11 @@ protocol AudioSessionClient: AnyObject {
 /// Phone calls do not: directions keep speaking while a call rings or is connected,
 /// and the audio interruption a call causes is not treated as a hold.
 ///
-/// A turn prompt is spoken only while it is still true: same route and maneuver,
-/// guidance eligible, and its position measurement not yet expired. It is checked
-/// again right before speaking, and a turn being spoken is cut off when it stops being true.
+/// A turn prompt starts only while it is still true: same route and maneuver, and
+/// guidance eligible (a current GPS position). Once started it is allowed to finish,
+/// even if the rider passes the turn or the fix it was planned from ages while newer
+/// fixes keep coming; it is cut only when it becomes wrong: GPS lost (eligibility
+/// gone), the route replaced, a hold, or the ride ending.
 @MainActor
 @Observable
 final class VoiceGuide {
@@ -131,8 +133,8 @@ final class VoiceGuide {
         if current != nil { speech.stop() }
         current = nil
         let prompt = VoicePrompt(text: text, priority: .turn, session: latest.session, generation: latest.generation,
-                                 step: latest.step?.sequence, validUntil: VoicePromptPlanner.validity(latest))
-        guard isCurrent(prompt) else { return }
+                                 step: latest.step?.sequence)
+        guard isCurrent(prompt, speaking: false) else { return }
         say(prompt)
     }
 
@@ -193,25 +195,26 @@ final class VoiceGuide {
         current = nil
         let next = pending
         pending = nil
-        if let next, holds.isEmpty, isCurrent(next) {
+        if let next, holds.isEmpty, isCurrent(next, speaking: false) {
             say(next)
         } else {
             audio.deactivate()
         }
     }
 
-    /// Whether a prompt is still true right now. Status prompts stay valid; a turn
-    /// needs eligible guidance on the same route and maneuver and an unexpired measurement.
-    private func isCurrent(_ prompt: VoicePrompt) -> Bool {
+    /// Whether a turn prompt may be (or keep being) spoken. Status prompts always may.
+    /// Not yet started: eligible guidance on the same route and still the same maneuver.
+    /// Already speaking: eligible guidance on the same route; passing the turn is fine.
+    private func isCurrent(_ prompt: VoicePrompt, speaking: Bool) -> Bool {
         guard prompt.priority == .turn else { return true }
-        guard eligible, let latest, latest.state == .active, latest.session == prompt.session,
-              latest.generation == prompt.generation, latest.step?.sequence == prompt.step else { return false }
-        return prompt.validUntil.map { clock.now < $0 } ?? true
+        guard eligible, let latest, latest.session == prompt.session,
+              latest.generation == prompt.generation else { return false }
+        return speaking || (latest.state == .active && latest.step?.sequence == prompt.step)
     }
 
     private func dropObsoleteTurns() {
-        if let pending, !isCurrent(pending) { self.pending = nil }
-        if let current, !isCurrent(current.prompt) {
+        if let pending, !isCurrent(pending, speaking: false) { self.pending = nil }
+        if let current, !isCurrent(current.prompt, speaking: true) {
             self.current = nil
             speech.stop()
             audio.deactivate()

@@ -22,6 +22,7 @@ struct ReviewRegressionTests {
         voice.handle(turn(50), eligible: true)
         #expect(speech.texts == ["In 250 metres, turn left."], "the 'Now' prompt is pending")
         clock.advance(by: .seconds(5))
+        voice.setEligible(false)
         speech.finish(1)
         #expect(speech.texts.count == 1, "measurement expired while waiting: the pending turn is dropped")
         #expect(audio.log.last == "deactivate")
@@ -786,6 +787,53 @@ struct FourthReviewRegressionTests {
         #expect(!reopened.isRecording, "and the interrupted ride doesn't resume recording")
         let again = RideHistoryStore(directory: storage, now: now.addingTimeInterval(120), defaults: defaults)
         #expect(!again.enabled, "once stored, it stays off")
+    }
+}
+
+
+/// Voice cut off mid-instruction (ride report, 2026-11-14).
+@MainActor
+struct VoiceCutoffTests {
+    let clock = ManualClock()
+    let speech = FakeSpeech()
+    let audio = FakeAudio()
+    let session = SessionID()
+
+    func snap(_ metres: Int, sequence: Int = 3, generation: Int = 0) -> NavigationSnapshot {
+        NavigationSnapshot(session: session, generation: RouteGeneration(generation), observedAt: clock.now, state: .active,
+                           step: GuidanceStep(maneuver: .roundaboutClockwise, roundaboutExit: 3, roundaboutDirection: .right,
+                                              distanceMetres: metres, roadText: "Jan Marg", sequence: sequence),
+                           remainingMetres: 2_000, remainingSeconds: 200, measurementAt: clock.now)
+    }
+
+    @Test func aLongInstructionFinishesWhileFreshFixesKeepComing() {
+        let voice = VoiceGuide(speech: speech, audio: audio, clock: clock)
+        voice.handle(snap(290), eligible: true)
+        for t in 1...7 {
+            clock.advance(by: .seconds(1))
+            voice.handle(snap(290 - 10 * t), eligible: true)
+        }
+        #expect(speech.stops == 0, "a 6-7 s instruction isn't cut at 5 s")
+    }
+
+    @Test func passingTheTurnMidSentenceDoesNotCutIt() {
+        let voice = VoiceGuide(speech: speech, audio: audio, clock: clock)
+        voice.handle(snap(40), eligible: true)
+        clock.advance(by: .seconds(2))
+        voice.handle(snap(900, sequence: 4), eligible: true)
+        #expect(speech.stops == 0)
+        #expect(speech.texts.count == 1)
+    }
+
+    @Test func gpsLossAndRouteChangeStillCutIt() {
+        let voice = VoiceGuide(speech: speech, audio: audio, clock: clock)
+        voice.handle(snap(290), eligible: true)
+        voice.setEligible(false)
+        #expect(speech.stops == 1, "GPS lost: the instruction may be wrong now")
+        voice.setEligible(true)
+        voice.handle(snap(50), eligible: true)
+        voice.handle(snap(300, generation: 1), eligible: true)
+        #expect(speech.stops == 2, "new route: the old instruction is cut")
     }
 }
 
